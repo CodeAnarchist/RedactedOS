@@ -17,6 +17,7 @@
 
 #define BPP 4
 
+//TODO: format logs
 VirtioGPUDriver* VirtioGPUDriver::try_init(gpu_size preferred_screen_size){
     VirtioGPUDriver* driver = new VirtioGPUDriver();
     if (driver->init(preferred_screen_size))
@@ -27,7 +28,7 @@ VirtioGPUDriver* VirtioGPUDriver::try_init(gpu_size preferred_screen_size){
 
 bool VirtioGPUDriver::init(gpu_size preferred_screen_size){
     
-    uint64_t addr = find_pci_device(0x1AF4, 0x1050);
+    uint64_t addr = find_pci_device(VIRTIO_VENDOR, VIRTIO_GPU_ID);
     if (!addr){ 
         kprintf("Virtio GPU not found");
         return false;
@@ -58,8 +59,7 @@ bool VirtioGPUDriver::init(gpu_size preferred_screen_size){
     kprintf("Stride %i",screen_size.width * BPP);
     
     framebuffer_size = screen_size.width * screen_size.height * BPP;
-    framebuffer_size = (framebuffer_size);
-    framebuffer = talloc(framebuffer_size);
+    framebuffer = (uintptr_t)kalloc(gpu_dev.memory_page, framebuffer_size, ALIGN_4KB, true, true);
 
     fb_set_bounds(screen_size.width,screen_size.height);
     
@@ -113,8 +113,7 @@ typedef struct virtio_2d_resource {
 } virtio_2d_resource;
 
 gpu_size VirtioGPUDriver::get_display_info(){
-    //TODO: replace talloc as we did in disk
-    virtio_gpu_ctrl_hdr* cmd = (virtio_gpu_ctrl_hdr*)talloc(sizeof(virtio_gpu_ctrl_hdr));
+    virtio_gpu_ctrl_hdr* cmd = (virtio_gpu_ctrl_hdr*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_ctrl_hdr), ALIGN_4KB, true, true);
     cmd->type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
     cmd->flags = 0;
     cmd->fence_id = 0;
@@ -124,18 +123,18 @@ gpu_size VirtioGPUDriver::get_display_info(){
     cmd->padding[1] = 0;
     cmd->padding[2] = 0;
 
-    virtio_gpu_resp_display_info* resp = (virtio_gpu_resp_display_info*)talloc(sizeof(virtio_gpu_resp_display_info));
+    virtio_gpu_resp_display_info* resp = (virtio_gpu_resp_display_info*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_resp_display_info), ALIGN_4KB, true, true);
 
     if (!virtio_send(&gpu_dev, gpu_dev.common_cfg->queue_desc, gpu_dev.common_cfg->queue_driver, gpu_dev.common_cfg->queue_device,
         (uintptr_t)cmd, sizeof(virtio_gpu_ctrl_hdr), (uintptr_t)resp, sizeof(virtio_gpu_resp_display_info), VIRTQ_DESC_F_WRITE)){
-        temp_free(cmd, sizeof(virtio_gpu_ctrl_hdr));
-        temp_free(resp, sizeof(virtio_gpu_resp_display_info));
+        kfree((void*)cmd, sizeof(virtio_gpu_ctrl_hdr));
+        kfree((void*)resp, sizeof(virtio_gpu_resp_display_info));
         return (gpu_size){0, 0};
     }
 
     if (resp->hdr.type != 0x1101) {
-        temp_free(cmd, sizeof(virtio_gpu_ctrl_hdr));
-        temp_free(resp, sizeof(virtio_gpu_resp_display_info));
+        kfree((void*)(void*)cmd, sizeof(virtio_gpu_ctrl_hdr));
+        kfree((void*)resp, sizeof(virtio_gpu_resp_display_info));
         return (gpu_size){0, 0};
     }
 
@@ -151,13 +150,13 @@ gpu_size VirtioGPUDriver::get_display_info(){
     }
 
     scanout_found = false;
-    temp_free(cmd, sizeof(virtio_gpu_ctrl_hdr));
-    temp_free(resp, sizeof(virtio_gpu_resp_display_info));
+    kfree((void*)cmd, sizeof(virtio_gpu_ctrl_hdr));
+    kfree((void*)resp, sizeof(virtio_gpu_resp_display_info));
     return (gpu_size){0, 0};
 }
 
 bool VirtioGPUDriver::create_2d_resource(gpu_size size) {
-    virtio_2d_resource* cmd = (virtio_2d_resource*)talloc(sizeof(virtio_2d_resource));
+    virtio_2d_resource* cmd = (virtio_2d_resource*)kalloc(gpu_dev.memory_page, sizeof(virtio_2d_resource), ALIGN_4KB, true, true);
     
     cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
     cmd->hdr.flags = 0;
@@ -172,23 +171,23 @@ bool VirtioGPUDriver::create_2d_resource(gpu_size size) {
     cmd->width = size.width;
     cmd->height = size.height;
 
-    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)talloc(sizeof(virtio_gpu_ctrl_hdr));
+    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_ctrl_hdr), ALIGN_4KB, true, true);
 
     if (!virtio_send(&gpu_dev, gpu_dev.common_cfg->queue_desc, gpu_dev.common_cfg->queue_driver, gpu_dev.common_cfg->queue_device,
         (uintptr_t)cmd, sizeof(virtio_2d_resource), (uintptr_t)resp, sizeof(virtio_gpu_ctrl_hdr), VIRTQ_DESC_F_WRITE)){
-        temp_free(cmd, sizeof(virtio_2d_resource));
-        temp_free(resp, sizeof(virtio_gpu_ctrl_hdr));
+        kfree((void*)cmd, sizeof(virtio_2d_resource));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
     
     if (resp->type != 0x1100) {
-        temp_free(cmd, sizeof(virtio_2d_resource));
-        temp_free(resp, sizeof(virtio_gpu_ctrl_hdr));
+        kfree((void*)cmd, sizeof(virtio_2d_resource));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
-    temp_free(cmd, sizeof(virtio_2d_resource));
-    temp_free(resp, sizeof(virtio_gpu_ctrl_hdr));
+    kfree((void*)cmd, sizeof(virtio_2d_resource));
+    kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
 
     return true;
 }
@@ -205,7 +204,7 @@ typedef struct virtio_backing_cmd {
 }__attribute__((packed)) virtio_backing_cmd;
 
 bool VirtioGPUDriver::attach_backing() {
-    virtio_backing_cmd* cmd = (virtio_backing_cmd*)talloc(sizeof(virtio_backing_cmd));
+    virtio_backing_cmd* cmd = (virtio_backing_cmd*)kalloc(gpu_dev.memory_page, sizeof(virtio_backing_cmd), ALIGN_4KB, true, true);
 
     cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
     cmd->hdr.flags = 0;
@@ -222,23 +221,23 @@ bool VirtioGPUDriver::attach_backing() {
     cmd->entries[0].length = framebuffer_size;
     cmd->entries[0].padding = 0;
 
-    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)talloc(sizeof(virtio_gpu_ctrl_hdr));
+    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_ctrl_hdr), ALIGN_4KB, true, true);
 
     if (!virtio_send2(&gpu_dev, gpu_dev.common_cfg->queue_desc, gpu_dev.common_cfg->queue_driver, gpu_dev.common_cfg->queue_device,
         (uintptr_t)cmd, sizeof(*cmd), (uintptr_t)resp, sizeof(virtio_gpu_ctrl_hdr), VIRTQ_DESC_F_NEXT)){
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(virtio_gpu_ctrl_hdr));
+        kfree((void*)cmd, sizeof(*cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
     if (resp->type != 0x1100) {
-        temp_free(cmd, sizeof(virtio_backing_cmd));
-        temp_free(resp, sizeof(virtio_gpu_ctrl_hdr));
+        kfree((void*)cmd, sizeof(virtio_backing_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
-    temp_free(cmd, sizeof(virtio_backing_cmd));
-    temp_free(resp, sizeof(virtio_gpu_ctrl_hdr));
+    kfree((void*)cmd, sizeof(virtio_backing_cmd));
+    kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
     return true;
 }
 
@@ -250,7 +249,7 @@ typedef struct virtio_scanout_cmd {
 }__attribute__((packed)) virtio_scanout_cmd;
 
 bool VirtioGPUDriver::set_scanout() {
-    virtio_scanout_cmd* cmd = (virtio_scanout_cmd*)talloc(sizeof(virtio_scanout_cmd));
+    virtio_scanout_cmd* cmd = (virtio_scanout_cmd*)kalloc(gpu_dev.memory_page, sizeof(virtio_scanout_cmd), ALIGN_4KB, true, true);
     
     cmd->r.x = 0;
     cmd->r.y = 0;
@@ -269,23 +268,23 @@ bool VirtioGPUDriver::set_scanout() {
     cmd->hdr.padding[1] = 0;
     cmd->hdr.padding[2] = 0;
 
-    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)talloc(sizeof(virtio_gpu_ctrl_hdr));
+    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_ctrl_hdr), ALIGN_4KB, true, true);
 
     if (!virtio_send(&gpu_dev, gpu_dev.common_cfg->queue_desc, gpu_dev.common_cfg->queue_driver, gpu_dev.common_cfg->queue_device,
         (uintptr_t)cmd, sizeof(*cmd), (uintptr_t)resp, sizeof(virtio_gpu_ctrl_hdr), VIRTQ_DESC_F_WRITE)){
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(*resp));
+        kfree((void*)cmd, sizeof(virtio_scanout_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
     if (resp->type != 0x1100) {
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(*resp));
+        kfree((void*)cmd, sizeof(virtio_scanout_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
-    temp_free(cmd, sizeof(*cmd));
-    temp_free(resp, sizeof(*resp));
+    kfree((void*)cmd, sizeof(virtio_scanout_cmd));
+    kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
     return true;
 }
 
@@ -298,7 +297,7 @@ typedef struct virtio_transfer_cmd {
 }__attribute__((packed)) virtio_transfer_cmd;
 
 bool VirtioGPUDriver::transfer_to_host(gpu_rect rect) {
-    virtio_transfer_cmd* cmd = (virtio_transfer_cmd*)talloc(sizeof(virtio_transfer_cmd));
+    virtio_transfer_cmd* cmd = (virtio_transfer_cmd*)kalloc(gpu_dev.memory_page, sizeof(virtio_transfer_cmd), ALIGN_4KB, true, true);
     
     cmd->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     cmd->hdr.flags = 0;
@@ -314,23 +313,23 @@ bool VirtioGPUDriver::transfer_to_host(gpu_rect rect) {
     cmd->rect.width = rect.size.width;
     cmd->rect.height = rect.size.height;
 
-    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)talloc(sizeof(virtio_gpu_ctrl_hdr));
+    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_ctrl_hdr), ALIGN_4KB, true, true);
 
     if (!virtio_send(&gpu_dev, gpu_dev.common_cfg->queue_desc, gpu_dev.common_cfg->queue_driver, gpu_dev.common_cfg->queue_device,
-        (uintptr_t)cmd, sizeof(*cmd), (uintptr_t)resp, sizeof(*resp), VIRTQ_DESC_F_WRITE)){
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(*resp));
+        (uintptr_t)cmd, sizeof(virtio_transfer_cmd), (uintptr_t)resp, sizeof(virtio_gpu_ctrl_hdr), VIRTQ_DESC_F_WRITE)){
+        kfree((void*)cmd, sizeof(virtio_transfer_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
     if (resp->type != 0x1100) {
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(*resp));
+        kfree((void*)cmd, sizeof(virtio_transfer_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return false;
     }
 
-    temp_free(cmd, sizeof(*cmd));
-    temp_free(resp, sizeof(*resp));
+    kfree((void*)cmd, sizeof(virtio_transfer_cmd));
+    kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
     return true;
 }
 
@@ -344,7 +343,7 @@ typedef struct virtio_flush_cmd {
 void VirtioGPUDriver::flush() {
 
     if (full_redraw) {
-        transfer_to_host((gpu_rect){0,0,screen_size.width,screen_size.height});
+        transfer_to_host((gpu_rect){{0,0},{screen_size.width,screen_size.height}});
     } else {
         for (uint32_t i = 0; i < dirty_count; i++) {
             gpu_rect r = dirty_rects[i];
@@ -352,7 +351,7 @@ void VirtioGPUDriver::flush() {
         }
     }
     
-    virtio_flush_cmd* cmd = (virtio_flush_cmd*)talloc(sizeof(virtio_flush_cmd));
+    virtio_flush_cmd* cmd = (virtio_flush_cmd*)kalloc(gpu_dev.memory_page, sizeof(virtio_flush_cmd), ALIGN_4KB, true, true);
     
     cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd->hdr.flags = 0;
@@ -367,23 +366,23 @@ void VirtioGPUDriver::flush() {
     cmd->rect.width = screen_size.width;
     cmd->rect.height = screen_size.height;
 
-    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)talloc(sizeof(virtio_gpu_ctrl_hdr));
+    virtio_gpu_ctrl_hdr* resp = (virtio_gpu_ctrl_hdr*)kalloc(gpu_dev.memory_page, sizeof(virtio_gpu_ctrl_hdr), ALIGN_4KB, true, true);
 
     if (!virtio_send(&gpu_dev, gpu_dev.common_cfg->queue_desc, gpu_dev.common_cfg->queue_driver, gpu_dev.common_cfg->queue_device,
-        (uintptr_t)cmd, sizeof(*cmd), (uintptr_t)resp, sizeof(*resp), VIRTQ_DESC_F_WRITE)){
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(*resp));
+        (uintptr_t)cmd, sizeof(virtio_flush_cmd), (uintptr_t)resp, sizeof(virtio_gpu_ctrl_hdr), VIRTQ_DESC_F_WRITE)){
+        kfree((void*)cmd, sizeof(virtio_flush_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return;
     }
 
     if (resp->type != 0x1100) {
-        temp_free(cmd, sizeof(*cmd));
-        temp_free(resp, sizeof(*resp));
+        kfree((void*)cmd, sizeof(virtio_flush_cmd));
+        kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
         return;
     }
 
-    temp_free(cmd, sizeof(*cmd));
-    temp_free(resp, sizeof(*resp));
+    kfree((void*)cmd, sizeof(virtio_flush_cmd));
+    kfree((void*)resp, sizeof(virtio_gpu_ctrl_hdr));
     return;
 }
 

@@ -1,4 +1,4 @@
-#/!bin/sh
+#!/bin/sh
 
 echo "Running virt emulator"
 
@@ -17,10 +17,14 @@ fi
 
 OS_TYPE="$(uname)"
 
-if [[ "$OS_TYPE" == "Darwin" ]]; then
+DISPLAY_MODE="default"
+SELECTED_GPU="virtio-gpu-pci"
+
+if [ "$OS_TYPE" = "Darwin" ]; then
     NETARG="vmnet-bridged,id=net0,ifname=en0"
     PRIVILEGE="sudo"
-elif [[ "$OS_TYPE" == "Linux" ]]; then
+    DISPLAY_MODE="sdl"
+elif [ "$OS_TYPE" = "Linux" ]; then
     NETARG="user,id=net0"
     PRIVILEGE=""
 else
@@ -33,8 +37,8 @@ $PRIVILEGE qemu-system-aarch64 \
   -cpu cortex-a72 \
   -m 512M \
   -kernel kernel.elf \
-  -device virtio-gpu-pci \
-  -display sdl \
+  -device $SELECTED_GPU \
+  -display $DISPLAY_MODE \
   -netdev $NETARG \
   -device virtio-net-pci,netdev=net0 \
   -serial mon:stdio \
@@ -42,5 +46,7 @@ $PRIVILEGE qemu-system-aarch64 \
   -device virtio-blk-pci,drive=hd0 \
   -device qemu-xhci,${MSI_CAPABILITIES}id=usb \
   -device usb-kbd,bus=usb.0 \
+  -device virtio-sound-pci,audiodev=sdl_audio \
+  -audiodev sdl,id=sdl_audio \
   -d guest_errors \
   $ARGS

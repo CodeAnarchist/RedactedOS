@@ -13,6 +13,7 @@
 #include "std/string.h"
 #include "exceptions/timer.h"
 #include "networking/network.h"
+#include "networking/port_manager.h"
 
 void sync_el0_handler_c(){
     save_context_registers();
@@ -39,8 +40,7 @@ void sync_el0_handler_c(){
     uint64_t spsr;
     asm volatile ("mrs %0, spsr_el1" : "=r"(spsr));
 
-    uint64_t currentEL;
-    asm volatile ("mov %0, x18" : "=r"(currentEL));
+    uint64_t currentEL = (spsr >> 2) & 3;
 
     uint64_t sp_el;
     asm volatile ("mov %0, x11" : "=r"(sp_el));
@@ -50,7 +50,6 @@ void sync_el0_handler_c(){
 
     uint64_t ec = (esr >> 26) & 0x3F;
     uint64_t iss = esr & 0xFFFFFF;
-
     
     uint64_t result = 0;
     if (ec == 0x15) {
@@ -61,13 +60,13 @@ void sync_el0_handler_c(){
             if ((uintptr_t)page_ptr == 0x0){
                 handle_exception_with_info("Wrong process heap state", iss);
             }
-            result = (uintptr_t)allocate_in_page(page_ptr, x0, ALIGN_16B, get_current_privilege(), false);
+            result = (uintptr_t)kalloc(page_ptr, x0, ALIGN_16B, get_current_privilege(), false);
             break;
         case 1:
-            free_from_page((void*)x0, x1);
+            kfree((void*)x0, x1);
             break;
         case 3:
-            kprintf_l((const char *)x0);
+            kprint((const char *)x0);
             break;
 
         case 5:
@@ -112,7 +111,7 @@ void sync_el0_handler_c(){
             break;
 
         case 21:
-            result = (uintptr_t)allocate_in_page((void*)get_current_heap(), sizeof(gpu_size), ALIGN_16B, get_current_privilege(), false);
+            result = (uintptr_t)kalloc((void*)get_current_heap(), sizeof(gpu_size), ALIGN_16B, get_current_privilege(), false);
             gpu_size size = gpu_get_screen_size();
             memcpy((void*)result, &size, sizeof(gpu_size));
             break;
@@ -133,24 +132,34 @@ void sync_el0_handler_c(){
             result = timer_now_msec();
             break;
 
-        case 51:
-            result = network_bind_port(x0, get_current_proc_pid());
+        case 51: {  //bind
+            uint16_t port     = (uint16_t)x0;
+            port_recv_handler_t handler = (port_recv_handler_t)x1;
+            protocol_t proto  = (protocol_t)x2;
+            uint16_t pid      = get_current_proc_pid();
+            result = port_bind_manual(port, pid, proto, handler);
             break;
+        }
 
-        case 52:
-            result = network_unbind_port(x0, get_current_proc_pid());
+        case 52: {  //unbind
+            uint16_t port    = (uint16_t)x0;
+            protocol_t proto = (protocol_t)x2;
+            uint16_t pid     = get_current_proc_pid();
+            result = port_unbind(port, proto, pid);
             break;
+        }
 
-        case 53:
-            network_connection_ctx *ctx = (network_connection_ctx*)x2;
-            void* payload = (void*)x3;
-            network_send_packet(x0, x1, ctx, payload, x4);
+        case 53: { //net_tx_frame
+            uintptr_t frame_ptr = x0;
+            uint32_t  frame_len = (uint32_t)x1;
+            result = net_tx_frame(frame_ptr, frame_len);
             break;
-
-        case 54:
-            sizedptr *ptr = (sizedptr*)x0;
-            result = network_read_packet_current(ptr);
+        }
+        case 54: { //net_rx_frame
+            sizedptr *user_out = (sizedptr*)x0;
+            result = net_rx_frame(user_out);
             break;
+        }
         
         default:
             handle_exception_with_info("Unknown syscall", iss);
@@ -167,7 +176,8 @@ void sync_el0_handler_c(){
             stop_current_process();
         }
     }
-    save_syscall_return(result);
+    if (result > 0)
+        save_syscall_return(result);
     process_restore();
 }
 

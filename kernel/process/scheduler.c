@@ -7,7 +7,7 @@
 #include "input/input_dispatch.h"
 #include "exceptions/exception_handler.h"
 #include "exceptions/timer.h"
-
+#include "console/kconsole/kconsole.h"
 extern void save_context(process_t* proc);
 extern void save_pc_interrupt(process_t* proc);
 extern void restore_context(process_t* proc);
@@ -41,7 +41,7 @@ void save_return_address_interrupt(){
 
 //TODO: Processes can currently exit and just crash the whole system with an EL1 Sync exception trying to read from 0x0. Better than continuing execution past bounds but still not great
 void switch_proc(ProcSwitchReason reason) {
-    // kprintf_raw("Stopping execution of process %i at %x",current_proc, processes[current_proc].spsr);
+    // kprintf("Stopping execution of process %i at %x",current_proc, processes[current_proc].spsr);
     if (proc_count == 0)
         panic("No processes active");
     int next_proc = (current_proc + 1) % MAX_PROCS;
@@ -63,6 +63,7 @@ void process_restore(){
 }
 
 void start_scheduler(){
+    kconsole_clear();
     disable_interrupt();
     timer_init(1);
     switch_proc(YIELD);
@@ -93,7 +94,7 @@ uint16_t get_current_proc_pid(){
 
 void reset_process(process_t *proc){
     proc->sp = 0;
-    free_page((void*)proc->stack-proc->stack_size,proc->stack_size);
+    pfree((void*)proc->stack-proc->stack_size,proc->stack_size);
     proc->pc = 0;
     proc->spsr = 0;
     for (int j = 0; j < 31; j++)
@@ -120,9 +121,9 @@ void init_main_process(){
     reset_process(proc);
     proc->id = next_proc_index++;
     proc->state = BLOCKED;
-    proc->heap = (uintptr_t)alloc_page(0x1000, true, false, false);
+    proc->heap = (uintptr_t)palloc(0x1000, true, false, false);
     proc->stack_size = 0x1000;
-    proc->stack = (uintptr_t)alloc_page(proc->stack_size,true,false,true);
+    proc->stack = (uintptr_t)palloc(proc->stack_size,true,false,true);
     ksp = proc->stack + proc->stack_size;
     proc->sp = ksp;
     name_process(proc, "kernel");
@@ -169,7 +170,7 @@ void stop_process(uint16_t pid){
         sys_unset_focus();
     //TODO: we don't wipe the process' data. If we do, we corrupt our sp, since we're still in the process' sp.
     proc_count--;
-    // kprintf_raw("Stopped %i process %i",pid,proc_count);
+    // kprintf("Stopped %i process %i",pid,proc_count);
     switch_proc(HALT);
 }
 
@@ -204,20 +205,24 @@ void sleep_process(uint64_t msec){
 }
 
 void wake_processes(){
-    uint16_t removed = 0;
-    uint64_t new_wake_time = 0;
-    for (uint16_t i = 0; i < sleep_count; i++){
-        uint64_t wake_time = sleeping[i].timestamp + sleeping[i].sleep_time;
-        if (wake_time <= timer_now_msec()){
-            process_t *proc = get_proc_by_pid(sleeping[i].pid);
-            proc->state = READY;
-            sleeping[i].valid = false;
-            removed++;
-        } else if (new_wake_time == 0 || wake_time < new_wake_time){
-            new_wake_time = wake_time;
+    uint64_t now = timer_now_msec();
+    uint64_t next = UINT64_MAX;
+    uint16_t w = 0;
+    for(uint16_t i=0;i<sleep_count;i++){
+        if(!sleeping[i].valid) continue;
+        uint64_t wake = sleeping[i].timestamp + sleeping[i].sleep_time;
+        if(wake <= now){
+            process_t *p = get_proc_by_pid(sleeping[i].pid);
+            if(p) p->state = READY;
+        }else{
+            if(wake < next) next = wake;
+            sleeping[w++] = sleeping[i];
         }
     }
-    sleep_count -= removed;
-    virtual_timer_reset(timer_now_msec() - new_wake_time);
-    virtual_timer_enable();
+    sleep_count = w;
+
+    if(next != UINT64_MAX){
+        virtual_timer_reset(next - now);
+        virtual_timer_enable();
+    }
 }

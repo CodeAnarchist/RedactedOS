@@ -8,13 +8,11 @@
 
 #define RECEIVE_QUEUE 0
 #define TRANSMIT_QUEUE 1
-#define MAX_size 0x1000
 
 #define kprintfv(fmt, ...) \
     ({ \
         if (verbose){\
-            uint64_t _args[] = { __VA_ARGS__ }; \
-            kprintf_args((fmt), _args, sizeof(_args) / sizeof(_args[0])); \
+            kprintf(fmt, ##__VA_ARGS__); \
         }\
     })
 
@@ -48,7 +46,7 @@ VirtioNetDriver* VirtioNetDriver::try_init(){
 }
 
 bool VirtioNetDriver::init(){
-    uint64_t addr = find_pci_device(0x1AF4, 0x1000);
+    uint64_t addr = find_pci_device(VIRTIO_VENDOR, VIRTIO_NET_ID);
     if (!addr){ 
         kprintf("[VIRTIO_NET error] Virtio network device not found");
         return false;
@@ -64,30 +62,28 @@ bool VirtioNetDriver::init(){
     uint8_t interrupts_ok = pci_setup_interrupts(addr, NET_IRQ, 2);
     switch(interrupts_ok){
         case 0:
-            kprintf_raw("[VIRTIO_NET] Failed to setup interrupts");
+            kprintf("[VIRTIO_NET] Failed to setup interrupts");
             return false;
         case 1:
-            kprintf_raw("[VIRTIO_NET] Interrupts setup with MSI-X %i, %i",NET_IRQ,NET_IRQ+1);
+            kprintf("[VIRTIO_NET] Interrupts setup with MSI-X %i, %i",NET_IRQ,NET_IRQ+1);
             break;
         default:
-            kprintf_raw("[VIRTIO_NET] Interrupts setup with MSI %i,%i",NET_IRQ,NET_IRQ+1);
+            kprintf("[VIRTIO_NET] Interrupts setup with MSI %i,%i",NET_IRQ,NET_IRQ+1);
             break;
     }
-
     pci_enable_device(addr);
 
     if (!virtio_init_device(&vnp_net_dev)) {
         kprintf("[VIRTIO_NET error] Failed network initialization");
         return false;
     }
-
     kprintf("[VIRTIO_NET] Device set up at %x",(uintptr_t)vnp_net_dev.device_cfg);
 
     select_queue(&vnp_net_dev, RECEIVE_QUEUE);
 
     for (uint16_t i = 0; i < 128; i++){
-        void* buf = allocate_in_page(vnp_net_dev.memory_page, MAX_size, ALIGN_64B, true, true);
-        virtio_add_buffer(&vnp_net_dev, i, (uintptr_t)buf, MAX_size);
+        void* buf = kalloc(vnp_net_dev.memory_page, MAX_PACKET_SIZE, ALIGN_64B, true, true);
+        virtio_add_buffer(&vnp_net_dev, i, (uintptr_t)buf, MAX_PACKET_SIZE);
     }
 
     vnp_net_dev.common_cfg->queue_msix_vector = 0;
@@ -109,7 +105,8 @@ bool VirtioNetDriver::init(){
     return true;
 }
 
-void VirtioNetDriver::get_mac(network_connection_ctx *context){
+
+void VirtioNetDriver::get_mac(net_l2l3_endpoint *context){
     virtio_net_config* net_config = (virtio_net_config*)vnp_net_dev.device_cfg;
     kprintfv("[VIRTIO_NET] %x:%x:%x:%x:%x:%x", net_config->mac[0], net_config->mac[1], net_config->mac[2], net_config->mac[3], net_config->mac[4], net_config->mac[5]);
 
@@ -121,10 +118,10 @@ void VirtioNetDriver::get_mac(network_connection_ctx *context){
 }
 
 sizedptr VirtioNetDriver::allocate_packet(size_t size){
-    return (sizedptr){(uintptr_t)allocate_in_page(vnp_net_dev.memory_page, size + header_size, ALIGN_64B, true, true),size + header_size};
+    return (sizedptr){(uintptr_t)kalloc(vnp_net_dev.memory_page, size + header_size, ALIGN_64B, true, true),size + header_size};
 }
 
-sizedptr VirtioNetDriver::handle_receive_packet(){
+sizedptr VirtioNetDriver::handle_receive_packet(void* buffer){
     select_queue(&vnp_net_dev, RECEIVE_QUEUE);
     struct virtq_used* used = (struct virtq_used*)(uintptr_t)vnp_net_dev.common_cfg->queue_device;
     struct virtq_desc* desc = (struct virtq_desc*)(uintptr_t)vnp_net_dev.common_cfg->queue_desc;
@@ -142,10 +139,14 @@ sizedptr VirtioNetDriver::handle_receive_packet(){
         uintptr_t packet = desc[desc_index].addr;
         packet += sizeof(virtio_net_hdr_t);
 
+        memcpy(buffer, (void*)packet, len);
+
         avail->ring[avail->idx % 128] = desc_index;
         avail->idx++;
 
         *(volatile uint16_t*)(uintptr_t)(vnp_net_dev.notify_cfg + vnp_net_dev.notify_off_multiplier * RECEIVE_QUEUE) = 0;
+
+        kfree((void*)desc[desc_index].addr, MAX_PACKET_SIZE);
 
         return (sizedptr){packet,len};
     }
@@ -158,7 +159,6 @@ void VirtioNetDriver::handle_sent_packet(){
 
     struct virtq_used* used = (struct virtq_used*)(uintptr_t)vnp_net_dev.common_cfg->queue_device;
     struct virtq_desc* desc = (struct virtq_desc*)(uintptr_t)vnp_net_dev.common_cfg->queue_desc;
-    struct virtq_avail* avail = (struct virtq_avail*)(uintptr_t)vnp_net_dev.common_cfg->queue_driver;
 
     uint16_t new_idx = used->idx;
 
@@ -168,7 +168,7 @@ void VirtioNetDriver::handle_sent_packet(){
         struct virtq_used_elem* e = &used->ring[used_ring_index];
         uint32_t desc_index = e->id;
         uint32_t len = e->len;
-        free_from_page((void*)desc[desc_index].addr, len);
+        kfree((void*)desc[desc_index].addr, len);
         return;
     }
 }
