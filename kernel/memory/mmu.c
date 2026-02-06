@@ -178,7 +178,7 @@ void mmu_unmap_table(uintptr_t *table, uintptr_t va, uintptr_t pa){
 
 void mmu_unmap(uint64_t va, uint64_t pa){
     mmu_unmap_table(kernel_mmu_page, va, pa);
-    mmu_unmap_table(pttbr, va, pa);
+    if (pttbr && pttbr != kernel_mmu_page) mmu_unmap_table(pttbr, va, pa);
 }
 
 uint64_t *mmu_alloc(){

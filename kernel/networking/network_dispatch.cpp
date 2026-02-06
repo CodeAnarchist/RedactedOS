@@ -133,7 +133,7 @@ int NetworkDispatch::net_task()
                 if (nics[n].rx.is_empty()) break;
                 sizedptr pkt{0,0};
                 if (!nics[n].rx.pop(pkt)) break;
-                netpkt_t* np = netpkt_wrap(pkt.ptr, pkt.size, pkt.size, NULL, 0);
+                netpkt_t* np = netpkt_wrap(pkt.ptr, pkt.size, 0 , pkt.size, NULL, 0);
                 if (np) {
                     eth_input(nics[n].ifindex, np);
                     netpkt_unref(np);

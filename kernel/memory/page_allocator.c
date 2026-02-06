@@ -36,6 +36,12 @@ uint64_t count_pages(uint64_t i1,uint64_t i2){
     return (i1/i2) + (i1 % i2 > 0);
 }
 
+static inline uint64_t lowmask64(uint64_t bits) {
+    if (!bits) return 0;
+    if (bits >= 64) return UINT64_MAX;
+    return (1ull << bits) - 1ull;
+}
+
 void pfree(void* ptr, uint64_t size) {
     int pages = count_pages(size,PAGE_SIZE);
     uint64_t addr = VIRT_TO_PHYS((uint64_t)ptr);
@@ -97,7 +103,7 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
             bool found = true;
             for (uint64_t j = 0; j < reg_count; j++){
                 if (fractional && j == reg_count-1)
-                    found &= (mem_bitmap[i + j] & ((1ULL << (fractional + 1)) - 1)) == 0;
+                    found &= (mem_bitmap[i + j] & lowmask64(fractional)) == 0;
                 else
                     found &= mem_bitmap[i + j] == 0;
                 
@@ -106,7 +112,7 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
             if (found){
                 for (uint64_t j = 0; j < reg_count; j++){
                     if (fractional && j == reg_count-1)
-                        mem_bitmap[i+j] |= ((1ULL << (fractional + 1)) - 1);
+                        mem_bitmap[i+j] |= lowmask64(fractional);
                     else
                         mem_bitmap[i+j] = UINT64_MAX;
                 }
@@ -142,10 +148,11 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
             }
             do {
                 bool found = true;
-                for (uint64_t b = bit; b < (uint64_t)min(64,bit + (page_count - 1)); b++){
-                    if (((mem_bitmap[i] >> b) & 1)){
-                        bit += page_count;
+                for (uint64_t b = bit; b < (uint64_t)min(64,bit + page_count); b++){
+                    if ((mem_bitmap[i] >> b) & 1ull){
+                        bit = b + 1;
                         found = false;
+                        break;
                     }
                 }
                 if (found) break;
