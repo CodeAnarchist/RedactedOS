@@ -52,25 +52,20 @@ restore_context:
     ldr x17, [x18, #(8 * 32)]
     msr elr_el1, x17
 
-    mov x17, #0
+    ldr x17, =pttbr
 
-    ldr x18, =pttbr
-    
-    cmp x18, #0
-    b.eq 4f
+    ldr x17, [x17]
 
-    ldr x18, [x18]
+    cbz x17, 4f
 
-    cmp x18, #0
-    b.eq 4f
-
-    msr ttbr0_el1, x18
+    msr ttbr0_el1, x17
 
     tlbi vmalle1is
 4: dsb ish
     isb
 
-    mov x18, #0
+    ldr x17,[x18, #(8 * 17)]
+    ldr x18, [x18, #(8 * 18)]
 
     eret
     

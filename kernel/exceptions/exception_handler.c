@@ -21,8 +21,9 @@ void handle_exception(const char* type, uint64_t info) {
 
     disable_visual();//Disable visual kprintf, since it has additional memory accesses that could be faulting
 
-    string s = string_format("%s \r\nESR_EL1: %llx\r\nELR_EL1: %llx\r\nFAR_EL1: %llx",(uintptr_t)type,esr,elr,far);
-    panic(s.data, info);
+    char buf[STRING_MAX_LEN];//no heap to avoid corruption
+    string_format_buf(buf, sizeof(buf), "%s \r\nESR_EL1: %llx\r\nELR_EL1: %llx\r\nFAR_EL1: %llx",type,esr,elr,far);
+    panic(buf, info);
 }
 
 void fiq_el1_handler(){ handle_exception("FIQ EXCEPTION\r\n", 0); }

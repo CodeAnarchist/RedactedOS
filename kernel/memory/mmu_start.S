@@ -1,17 +1,27 @@
 #include "sysregs.h"
 
 .global mmu_start
-mmu_start://(uint64_t *page x0)
+mmu_start:  //fn(uint64_t *ttbr1 x0, uint64_t *ttbr0 x1)
 .type mmu_start, %function
     ldr x3, =MAIR_VALUE
     msr mair_el1, x3
-    ldr x3, =TCR_VALUE
+
+    mrs x2, id_aa64mmfr0_el1
+    and x2, x2, #0xF
+    cmp x2, #6
+    b.ls 1f
+    mov x2, #6
+1:
+    lsl x2, x2, #32
+
+    ldr x3, =TCR_VALUE_BASE
+    orr x3, x3, x2
     msr tcr_el1, x3
     dsb ish
     isb
 
-    msr ttbr0_el1, x0
     msr ttbr1_el1, x0
+    msr ttbr0_el1, x1
     
     mrs x0, sctlr_el1
     orr x0, x0, #0x1

@@ -4,13 +4,34 @@
 
 #define NETPKT_F_VIEW 1u
 #define NETPKT_BUF_F_EXTERNAL 1u
+#define NETPKT_META_KEEP_EMPTY_PAGES 2u
 
 typedef struct netpkt_buf netpkt_buf_t;
 
-typedef struct meta_page {
-    struct meta_page* next;
-    uint32_t used;
-} meta_page_t;
+typedef struct meta_slab_page meta_slab_page_t;
+
+typedef struct meta_obj_hdr {
+    meta_slab_page_t*page;
+    uintptr_t pad;
+} meta_obj_hdr_t;
+
+struct meta_slab_page {
+    meta_slab_page_t* next;
+    void* free_list;
+    uint16_t in_use;
+    uint16_t capacity;
+    uint32_t stride;
+};
+
+typedef struct meta_slab {
+    meta_slab_page_t* partial;
+    meta_slab_page_t* full;
+    meta_slab_page_t* empty;
+    uint32_t obj_size;
+    uint32_t stride;
+    uint32_t empty_pages;
+    uint32_t keep_empty;
+} meta_slab_t;
 
 struct netpkt_buf {
     uintptr_t base;
@@ -32,15 +53,190 @@ struct netpkt {
 };
 
 static uint64_t g_netpkt_page_bytes;
+static uint64_t g_netpkt_payload_page_bytes;
+static uint64_t g_netpkt_meta_page_bytes;
 
-static meta_page_t* g_meta_pages;
-static meta_page_t* g_meta_cur;
-static uint8_t* g_meta_ptr;
-static uint8_t* g_meta_end;
+static meta_slab_t g_meta_slab_pkt;
+static meta_slab_t g_meta_slab_buf;
 
-static void* g_free_pkt;
-static void* g_free_buf;
 static uintptr_t g_spare_page;
+
+static void* meta_slab_alloc(meta_slab_t* s, uint32_t obj_size_aligned) {
+    if (!s) return 0;
+    if (!obj_size_aligned) return 0;
+    if ((obj_size_aligned & 15u) != 0u) return 0;
+
+    if (!s->obj_size) {
+        s->obj_size = obj_size_aligned;
+        s->stride = (uint32_t)(((uint64_t)sizeof(meta_obj_hdr_t) + (uint64_t)obj_size_aligned + 15ull) & ~15ull);
+        if (!s->stride) return 0;
+        s->keep_empty = NETPKT_META_KEEP_EMPTY_PAGES;
+    } else {
+        if (s->obj_size != obj_size_aligned) return 0;
+        if (!s->stride) return 0;
+    }
+
+    if (!s->partial) {
+        if (s->empty) {
+            meta_slab_page_t* p =s->empty;
+            s->empty = p->next;
+            if (s->empty_pages) s->empty_pages--;
+            p->next = s->partial;
+        s->partial = p;
+        } else {
+            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES) return 0;
+            if (g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES - (uint64_t)PAGE_SIZE) return 0;
+
+            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
+            g_netpkt_meta_page_bytes += (uint64_t)PAGE_SIZE;
+
+            meta_slab_page_t* p = (meta_slab_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
+            if (!p) {
+                if (g_netpkt_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_page_bytes-= (uint64_t)PAGE_SIZE;
+                else g_netpkt_page_bytes = 0;
+
+                if (g_netpkt_meta_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_meta_page_bytes -= (uint64_t)PAGE_SIZE;
+                else g_netpkt_meta_page_bytes = 0;
+                return 0;
+            }
+
+            p->next = 0;//
+            p->free_list = 0;
+            p->in_use = 0;
+            p->capacity = 0;
+            p->stride = s->stride;
+
+            uint8_t* start = (uint8_t*)p + (uint64_t)sizeof(*p);
+            start = (uint8_t*)(((uintptr_t)start + 15u) &~(uintptr_t)15u);
+
+            uint64_t avail = (uint64_t)PAGE_SIZE - (uint64_t)(start - (uint8_t*)p);
+            if (avail < (uint64_t)p->stride) {
+                pfree(p, (uint64_t)PAGE_SIZE);
+                if (g_netpkt_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
+                else g_netpkt_page_bytes = 0;
+
+                if (g_netpkt_meta_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_meta_page_bytes -= (uint64_t)PAGE_SIZE;
+                else g_netpkt_meta_page_bytes = 0;
+                return 0;
+            }
+
+            uint32_t cap = (uint32_t)(avail / (uint64_t)p->stride);
+            if (!cap) {
+                pfree(p, (uint64_t)PAGE_SIZE);
+                if (g_netpkt_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
+                else g_netpkt_page_bytes = 0;
+                if (g_netpkt_meta_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_meta_page_bytes -= (uint64_t)PAGE_SIZE;
+                else g_netpkt_meta_page_bytes = 0;
+                return 0;
+            }
+
+            p->capacity = (uint16_t)cap;
+
+            uint32_t i = 0;
+            while (i< cap) {
+                uint8_t* slot = start + (uint64_t)i * (uint64_t)p->stride;
+                meta_obj_hdr_t* h = (meta_obj_hdr_t*)(uintptr_t)slot;
+                h->page = p;
+                h->pad = 0;
+                void* obj = (void*)(uintptr_t)(slot + (uint64_t)sizeof(*h));
+
+                *(void**)obj = p->free_list;
+                p->free_list = obj;
+                i++;
+            }
+
+            p->next = s->partial;
+            s->partial = p;
+        }
+    }
+
+    meta_slab_page_t* page = s->partial;
+    if (!page) return 0;
+    if (!page->free_list) return 0;
+
+    void* obj = page->free_list;
+    page->free_list = *(void**)obj;
+    page->in_use++;
+
+    if (page->in_use == page->capacity) {
+        s->partial = page->next;
+        page->next = s->full;
+        s->full = page;
+    }
+
+    return obj;
+}
+
+static void meta_slab_free(meta_slab_t* s, void* obj) {
+    if (!s) return;
+    if (!obj) return;
+
+    meta_obj_hdr_t* h = (meta_obj_hdr_t*)(uintptr_t)obj -1;
+    meta_slab_page_t* page = h->page;
+    if (!page) return;
+
+    *(void**)obj = page->free_list;
+    page->free_list = obj;
+
+    bool was_full = false;
+    if (page->in_use == page->capacity) was_full = true;
+    if (page->in_use) page->in_use--;
+
+    if (was_full) {
+        meta_slab_page_t* prev = 0;
+        meta_slab_page_t* cur = s->full;
+        while (cur && cur != page) {
+            prev = cur;
+            cur = cur->next; //minchia fondamenti di informatica
+        }
+        if (cur) {
+            if (prev) prev->next = cur->next;
+            else s->full = cur->next;
+            cur->next = s->partial;
+            s->partial = cur;
+        }
+    }
+
+    if (!page->in_use) {
+        meta_slab_page_t* prev = 0;
+        meta_slab_page_t* cur = s->partial;
+        while (cur && cur != page) {
+            prev = cur;
+            cur = cur->next;
+        }
+        if (cur) {
+            if (prev) prev->next = cur->next;
+            else s->partial = cur->next;
+        } else {
+            prev = 0;
+            cur = s->full;
+            while (cur && cur != page) {
+                prev = cur;
+                cur = cur->next;
+            }
+            if (cur) {
+                if (prev) prev->next = cur->next;
+                else s->full = cur->next;
+            }
+        }
+
+        page->next = s->empty;
+        s->empty = page;
+        s->empty_pages++;
+
+        while (s->empty_pages > s->keep_empty){
+            meta_slab_page_t* e = s->empty;
+            if (!e) break;
+            s->empty = e->next;
+            s->empty_pages--;
+            pfree(e,(uint64_t)PAGE_SIZE);
+            if (g_netpkt_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
+            else g_netpkt_page_bytes = 0;
+            if (g_netpkt_meta_page_bytes >= (uint64_t)PAGE_SIZE) g_netpkt_meta_page_bytes -= (uint64_t)PAGE_SIZE;
+            else g_netpkt_meta_page_bytes = 0;
+        }
+    }
+}
 
 static bool netpkt_realloc_to(netpkt_t* p, uint32_t new_head, uint32_t new_alloc) {
     if (!p) return false;
@@ -70,58 +266,32 @@ static bool netpkt_realloc_to(netpkt_t* p, uint32_t new_head, uint32_t new_alloc
         if ((uint64_t)cap > (uint64_t)NETPKT_MAX_PAGE_BYTES) return false;
         if (g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES - (uint64_t)cap)return false;
         g_netpkt_page_bytes += (uint64_t)cap;
+        g_netpkt_payload_page_bytes += (uint64_t)cap;
 
         mem = palloc((uint64_t)cap, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
         if (!mem) {
-            g_netpkt_page_bytes -= (uint64_t)cap;
+            if (g_netpkt_page_bytes >= (uint64_t)cap) g_netpkt_page_bytes -= (uint64_t)cap;
+            else g_netpkt_page_bytes = 0;
+
+            if (g_netpkt_payload_page_bytes >= (uint64_t)cap) g_netpkt_payload_page_bytes -= (uint64_t)cap;
+            else g_netpkt_payload_page_bytes = 0;
             return false;
         }
     }
 
-    netpkt_buf_t* nb = 0;
-    void* n = g_free_buf;
-    if (n) {
-        g_free_buf = *(void**)n;
-        nb = (netpkt_buf_t*)n;
-    } else {
-        uint64_t size = (uint64_t)sizeof(*nb);
-        size = (size + 15ull) &~15ull;
-
-        if (!g_meta_cur || g_meta_ptr + size > g_meta_end) {
-            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES || g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES-(uint64_t)PAGE_SIZE) {
-                if (from_spare) {
-                    g_spare_page= (uintptr_t)mem;
-                } else {
-                    pfree(mem, (uint64_t)cap);
-                    g_netpkt_page_bytes -= (uint64_t)cap;
-                }
-                return false;
-            }
-            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
-
-            meta_page_t* mp = (meta_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW |MEM_NORM, true);
-            if (!mp) {
-                g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
-                if (from_spare) {
-                    g_spare_page = (uintptr_t)mem;
-                } else {
-                    pfree(mem, (uint64_t)cap);
-                    g_netpkt_page_bytes -= (uint64_t)cap;
-                }
-                return false;
-            }
-
-            mp->next= g_meta_pages;
-            mp->used = (uint32_t)sizeof(*mp);
-            g_meta_pages = mp;
-            g_meta_cur = mp;
-            g_meta_ptr = (uint8_t*)mp + mp->used;
-            g_meta_end = (uint8_t*)mp + PAGE_SIZE;
+    uint32_t sz = (uint32_t)(((uint64_t)sizeof(netpkt_buf_t) + 15) & ~15ull);
+    netpkt_buf_t* nb = (netpkt_buf_t*)meta_slab_alloc(&g_meta_slab_buf, sz);
+    if (!nb) {
+        if (from_spare) {
+            g_spare_page = (uintptr_t)mem;
+        } else {
+            pfree(mem, (uint64_t)cap);
+            if (g_netpkt_page_bytes >= (uint64_t)cap) g_netpkt_page_bytes -= (uint64_t)cap;
+            else g_netpkt_page_bytes = 0;
+            if (g_netpkt_payload_page_bytes >= (uint64_t)cap) g_netpkt_payload_page_bytes -= (uint64_t)cap;
+            else g_netpkt_payload_page_bytes = 0;
         }
-
-        nb = (netpkt_buf_t*)(uintptr_t)g_meta_ptr;
-        g_meta_ptr += size;
-        g_meta_cur->used = (uint32_t)(g_meta_ptr-(uint8_t*)g_meta_cur);
+        return false;
     }
 
     nb->base = (uintptr_t)mem;
@@ -155,17 +325,20 @@ static bool netpkt_realloc_to(netpkt_t* p, uint32_t new_head, uint32_t new_alloc
                         uint64_t dec = (uint64_t)ob->alloc-(uint64_t)PAGE_SIZE;
                         if (g_netpkt_page_bytes >= dec) g_netpkt_page_bytes -= dec;
                         else g_netpkt_page_bytes = 0;
+                        if (g_netpkt_payload_page_bytes >= dec) g_netpkt_payload_page_bytes -= dec;
+                        else g_netpkt_payload_page_bytes = 0;
                     }
                 } else {
                     if (ob->base) pfree((void*)ob->base,(uint64_t)ob->alloc);
                     uint64_t dec = (uint64_t)ob->alloc;
                     if (g_netpkt_page_bytes >= dec) g_netpkt_page_bytes -= dec;
                     else g_netpkt_page_bytes = 0;
+                    if (g_netpkt_payload_page_bytes >= dec) g_netpkt_payload_page_bytes -= dec;
+                    else g_netpkt_payload_page_bytes = 0;
                 }
             }
 
-            *(void**)ob = g_free_buf;
-            g_free_buf = ob;
+            meta_slab_free(&g_meta_slab_buf, ob);
         }
     }
 
@@ -194,58 +367,31 @@ netpkt_t* netpkt_alloc(uint32_t data_capacity, uint32_t headroom, uint32_t tailr
         if ((uint64_t)cap > (uint64_t)NETPKT_MAX_PAGE_BYTES) return 0;
         if (g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES - (uint64_t)cap) return 0;
         g_netpkt_page_bytes += (uint64_t)cap;
+        g_netpkt_payload_page_bytes += (uint64_t)cap;
 
         mem = palloc((uint64_t)cap, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
         if (!mem) {
-            g_netpkt_page_bytes -= (uint64_t)cap;
+            if (g_netpkt_page_bytes >= (uint64_t)cap) g_netpkt_page_bytes -= (uint64_t)cap;
+            else g_netpkt_page_bytes = 0;
+            if (g_netpkt_payload_page_bytes >= (uint64_t)cap) g_netpkt_payload_page_bytes -= (uint64_t)cap;
+            else g_netpkt_payload_page_bytes = 0;
             return 0;
         }
     }
 
-    netpkt_buf_t* b = 0;
-    void* n = g_free_buf;
-    if (n) {
-        g_free_buf = *(void**)n;
-        b = (netpkt_buf_t*)n;
-    } else{
-        uint64_t size = (uint64_t)sizeof(*b);
-        size =(size + 15ull) &~15ull;
-
-        if (!g_meta_cur || g_meta_ptr + size > g_meta_end) {
-            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES || g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES-(uint64_t)PAGE_SIZE) {
-                if (from_spare) {
-                    g_spare_page = (uintptr_t)mem;
-                } else {
-                    pfree(mem, (uint64_t)cap);
-                    g_netpkt_page_bytes -= (uint64_t)cap;
-                }
-                return 0;
-            }
-            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
-
-            meta_page_t* mp = (meta_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
-            if (!mp) {
-                g_netpkt_page_bytes-= (uint64_t)PAGE_SIZE;
-                if (from_spare) {
-                    g_spare_page = (uintptr_t)mem;
-                } else {
-                    pfree(mem, (uint64_t)cap);
-                    g_netpkt_page_bytes -= (uint64_t)cap;
-                }
-                return 0;
-            }
-
-            mp->next = g_meta_pages;
-            mp->used = (uint32_t)sizeof(*mp);
-            g_meta_pages = mp;
-            g_meta_cur = mp;
-            g_meta_ptr = (uint8_t*)mp + mp->used;
-            g_meta_end = (uint8_t*)mp + PAGE_SIZE;
+    uint32_t bsz = (uint32_t)(((uint64_t)sizeof(netpkt_buf_t) + 15ull) &~15ull);
+    netpkt_buf_t* b = (netpkt_buf_t*)meta_slab_alloc(&g_meta_slab_buf, bsz);
+    if (!b) {
+        if (from_spare) {
+            g_spare_page = (uintptr_t)mem;
+        } else {
+            pfree(mem, (uint64_t)cap);
+            if (g_netpkt_page_bytes >= (uint64_t)cap) g_netpkt_page_bytes -= (uint64_t)cap;
+            else g_netpkt_page_bytes = 0;
+            if (g_netpkt_payload_page_bytes >= (uint64_t)cap) g_netpkt_payload_page_bytes -= (uint64_t)cap;
+            else g_netpkt_payload_page_bytes = 0;
         }
-
-        b = (netpkt_buf_t*)(uintptr_t)g_meta_ptr;
-        g_meta_ptr += size;
-        g_meta_cur->used = (uint32_t)(g_meta_ptr-(uint8_t*)g_meta_cur);
+        return 0;
     }
 
     b->base = (uintptr_t)mem;
@@ -255,54 +401,20 @@ netpkt_t* netpkt_alloc(uint32_t data_capacity, uint32_t headroom, uint32_t tailr
     b->free_fn = 0;
     b->free_ctx = 0;
 
-    netpkt_t* p = 0;
-    n = g_free_pkt;
-    if (n) {
-        g_free_pkt = *(void**)n;
-        p = (netpkt_t*)n;
-    } else {
-        uint64_t size = (uint64_t)sizeof(*p);
-        size = (size + 15ull) &~15ull;
-
-        if (!g_meta_cur || g_meta_ptr + size > g_meta_end) {
-            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES || g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES-(uint64_t)PAGE_SIZE) {
-                if (from_spare) {
-                    g_spare_page = (uintptr_t)mem;
-                } else {
-                    pfree(mem, (uint64_t)cap);
-                    g_netpkt_page_bytes -= (uint64_t) cap;
-                }
-                *(void**)b = g_free_buf;
-                g_free_buf = b;
-                return 0;
-            }
-            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
-
-            meta_page_t* mp = (meta_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
-            if (!mp) {
-                g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
-                if (from_spare) {
-                    g_spare_page = (uintptr_t)mem;
-                } else {
-                    pfree(mem, (uint64_t)cap);
-                    g_netpkt_page_bytes -= (uint64_t)cap;
-                }
-                *(void**)b = g_free_buf;
-                g_free_buf = b;
-                return 0;
-            }
-
-            mp->next = g_meta_pages;
-            mp->used = (uint32_t)sizeof(*mp);
-            g_meta_pages = mp;
-            g_meta_cur = mp;
-            g_meta_ptr = (uint8_t*)mp + mp->used;
-            g_meta_end = (uint8_t*)mp + PAGE_SIZE;
+    uint32_t psz = (uint32_t)(((uint64_t)sizeof(netpkt_t) + 15ull) &~15ull);
+    netpkt_t* p = (netpkt_t*)meta_slab_alloc(&g_meta_slab_pkt, psz);
+    if (!p) {
+        meta_slab_free(&g_meta_slab_buf, b);
+        if (from_spare) {
+            g_spare_page = (uintptr_t)mem;
+        } else {
+            pfree(mem, (uint64_t)cap);
+            if (g_netpkt_page_bytes >= (uint64_t)cap) g_netpkt_page_bytes -= (uint64_t)cap;
+            else g_netpkt_page_bytes = 0;
+            if (g_netpkt_payload_page_bytes >= (uint64_t)cap) g_netpkt_payload_page_bytes -= (uint64_t)cap;
+            else g_netpkt_payload_page_bytes = 0;
         }
-
-        p = (netpkt_t*)(uintptr_t)g_meta_ptr;
-        g_meta_ptr += size;
-        g_meta_cur->used = (uint32_t)(g_meta_ptr - (uint8_t*)g_meta_cur);
+        return 0;
     }
 
     p->buf = b;
@@ -322,37 +434,9 @@ netpkt_t* netpkt_wrap(uintptr_t base, uint32_t alloc_size, uint32_t data_off, ui
     if (data_off > alloc_size) return 0;
     if (data_len > alloc_size - data_off) return 0;
 
-    netpkt_buf_t* b = 0;
-    void* n = g_free_buf;
-    if (n) {
-        g_free_buf = *(void**)n;
-        b = (netpkt_buf_t*)n;
-    } else {
-        uint64_t size = (uint64_t)sizeof(*b);
-        size = (size + 15ull) &~15ull;
-
-        if (!g_meta_cur || g_meta_ptr + size > g_meta_end) {
-            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES || g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES-(uint64_t)PAGE_SIZE) return 0;
-            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
-
-            meta_page_t* mp = (meta_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
-            if (!mp) {
-                g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
-                return 0;
-            }
-
-            mp->next = g_meta_pages;
-            mp->used = (uint32_t)sizeof(*mp);
-            g_meta_pages = mp;
-            g_meta_cur = mp;
-            g_meta_ptr = (uint8_t*)mp + mp->used;
-            g_meta_end = (uint8_t*)mp + PAGE_SIZE;
-        }
-
-        b = (netpkt_buf_t*)(uintptr_t)g_meta_ptr;
-        g_meta_ptr += size;
-        g_meta_cur->used = (uint32_t)(g_meta_ptr - (uint8_t*)g_meta_cur);
-    }
+    uint32_t bsz = (uint32_t)(((uint64_t)sizeof(netpkt_buf_t) + 15ull) &~15ull);
+    netpkt_buf_t* b = (netpkt_buf_t*)meta_slab_alloc(&g_meta_slab_buf, bsz);
+    if (!b) return 0;
 
     b->base = base;
     b->alloc = alloc_size;
@@ -361,42 +445,11 @@ netpkt_t* netpkt_wrap(uintptr_t base, uint32_t alloc_size, uint32_t data_off, ui
     b->free_fn = free_fn;
     b->free_ctx = ctx;
 
-    netpkt_t* p = 0;
-    n = g_free_pkt;
-    if (n) {
-        g_free_pkt = *(void**)n;
-        p = (netpkt_t*)n;
-    } else {
-        uint64_t size = (uint64_t)sizeof(*p);
-        size = (size + 15ull) &~15ull;
-
-        if (!g_meta_cur || g_meta_ptr + size > g_meta_end) {
-            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES || g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES-(uint64_t)PAGE_SIZE) {
-                *(void**)b = g_free_buf;
-                g_free_buf = b;
-                return 0;
-            }
-            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
-
-            meta_page_t* mp = (meta_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
-            if (!mp) {
-                g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
-                *(void**)b = g_free_buf;
-                g_free_buf = b;
-                return 0;
-            }
-
-            mp->next = g_meta_pages;
-            mp->used = (uint32_t)sizeof(*mp);
-            g_meta_pages = mp;
-            g_meta_cur = mp;
-            g_meta_ptr = (uint8_t*)mp + mp->used;
-            g_meta_end = (uint8_t*)mp + PAGE_SIZE;
-        }
-
-        p = (netpkt_t*)(uintptr_t)g_meta_ptr;
-        g_meta_ptr += size;
-        g_meta_cur->used = (uint32_t)(g_meta_ptr-(uint8_t*)g_meta_cur);
+    uint32_t psz = (uint32_t)(((uint64_t)sizeof(netpkt_t) + 15ull) &~15ull);
+    netpkt_t* p = (netpkt_t*)meta_slab_alloc(&g_meta_slab_pkt, psz);
+    if (!p) {
+        meta_slab_free(&g_meta_slab_buf, b);
+        return 0;
     }
 
     p->buf = b;
@@ -419,37 +472,9 @@ netpkt_t* netpkt_view(netpkt_t* parent, uint32_t off, uint32_t len) {
     uint64_t abs = (uint64_t)parent->off + (uint64_t)parent->head + (uint64_t)off;
     if (abs + (uint64_t)len > (uint64_t)parent->buf->alloc) return 0;
 
-    netpkt_t* v = 0;
-    void* n = g_free_pkt;
-    if (n) {
-        g_free_pkt = *(void**)n;
-        v = (netpkt_t*)n;
-    } else {
-        uint64_t size = (uint64_t)sizeof(*v);
-        size = (size + 15ull) &~15ull;
-
-        if (!g_meta_cur || g_meta_ptr + size > g_meta_end) {
-            if ((uint64_t)PAGE_SIZE > (uint64_t)NETPKT_MAX_PAGE_BYTES || g_netpkt_page_bytes > (uint64_t)NETPKT_MAX_PAGE_BYTES-(uint64_t)PAGE_SIZE) return 0;
-            g_netpkt_page_bytes += (uint64_t)PAGE_SIZE;
-
-            meta_page_t* mp = (meta_page_t*)palloc(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW | MEM_NORM, true);
-            if (!mp) {
-                g_netpkt_page_bytes -= (uint64_t)PAGE_SIZE;
-                return 0;
-            }
-
-            mp->next = g_meta_pages;
-            mp->used = (uint32_t)sizeof(*mp);
-            g_meta_pages = mp;
-            g_meta_cur = mp;
-            g_meta_ptr = (uint8_t*)mp + mp->used;
-            g_meta_end = (uint8_t*)mp + PAGE_SIZE;
-        }
-
-        v = (netpkt_t*)(uintptr_t)g_meta_ptr;
-        g_meta_ptr += size;
-        g_meta_cur->used = (uint32_t)(g_meta_ptr - (uint8_t*)g_meta_cur);
-    }
+    uint32_t psz = (uint32_t)(((uint64_t)sizeof(netpkt_t) + 15ull) &~15ull);
+    netpkt_t* v = (netpkt_t*)meta_slab_alloc(&g_meta_slab_pkt, psz);
+    if (!v) return 0;
 
     parent->buf->refs++;
 
@@ -491,22 +516,24 @@ void netpkt_unref(netpkt_t* p) {
                         uint64_t dec = (uint64_t)b->alloc-(uint64_t)PAGE_SIZE;
                         if (g_netpkt_page_bytes >= dec) g_netpkt_page_bytes -= dec;
                         else g_netpkt_page_bytes = 0;
+                        if (g_netpkt_payload_page_bytes >= dec) g_netpkt_payload_page_bytes -= dec;
+                        else g_netpkt_payload_page_bytes = 0;
                     }
                 } else {
                     if (b->base) pfree((void*)b->base, (uint64_t)b->alloc);
                     uint64_t dec = (uint64_t)b->alloc;
                     if (g_netpkt_page_bytes >= dec) g_netpkt_page_bytes -= dec;
                     else g_netpkt_page_bytes = 0;
+                    if (g_netpkt_payload_page_bytes >= dec) g_netpkt_payload_page_bytes -= dec;
+                    else g_netpkt_payload_page_bytes = 0;
                 }
             }
 
-            *(void**)b = g_free_buf;
-            g_free_buf = b;
+            meta_slab_free(&g_meta_slab_buf, b);
         }
     }
 
-    *(void**)p = g_free_pkt;
-    g_free_pkt = p;
+    meta_slab_free(&g_meta_slab_pkt, p);
 }
 
 uintptr_t netpkt_data(const netpkt_t* p) {
@@ -618,6 +645,8 @@ bool netpkt_pull(netpkt_t* p, uint32_t bytes) {
         pfree((void*)(p->buf->base + (uintptr_t)newcap), dec);
         if (g_netpkt_page_bytes >= dec) g_netpkt_page_bytes -= dec;
         else g_netpkt_page_bytes = 0;
+        if (g_netpkt_payload_page_bytes >= dec) g_netpkt_payload_page_bytes -= dec;
+        else g_netpkt_payload_page_bytes = 0;
         p->buf->alloc = newcap;
         p->cap = newcap;
     }
@@ -648,6 +677,8 @@ bool netpkt_trim(netpkt_t* p, uint32_t new_len) {
         pfree((void*)(p->buf->base + (uintptr_t)newcap), dec);
         if (g_netpkt_page_bytes >= dec) g_netpkt_page_bytes -= dec;
         else g_netpkt_page_bytes = 0;
+        if (g_netpkt_payload_page_bytes >= dec) g_netpkt_payload_page_bytes -= dec;
+        else g_netpkt_payload_page_bytes = 0;
         p->buf->alloc = newcap;
         p->cap = newcap;
     }

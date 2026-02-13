@@ -48,19 +48,19 @@ uint32_t print_branch(uint32_t instr, uint64_t pc, bool translate, process_layou
     int32_t imm26 = instr & 0x03FFFFFF;
     int32_t signed_imm = (imm26 << 6) >> 6;
     uint64_t target = pc + ((int64_t)signed_imm << 2);
-    kputfv("%x /*pc = %x*/", target, pc);
+    kputfv("%llx /*pc = %llx*/", target, pc);
 
     if (!translate) return instr;
 
     bool internal = (target >= source->code_base_start) && (target < source->code_base_start + source->code_size);
 
-    uint32_t offset = pc - source->code_base_start;
+    uint64_t offset = pc - source->code_base_start;
         
     if (!internal) {
         uint64_t dest_pc = destination->code_base_start + offset;
         int64_t rel = (int64_t)(target - dest_pc) >> 2;
         if (rel < -(1 << 25) || rel >= (1 << 25)) {
-            kputfv("O.O.R. %x", rel);//We need to account for out of range
+            kputfv("O.O.R. %llx", rel);//We need to account for out of range
         }
         return (instr & 0xFC000000) | ((uint32_t)(rel & 0x03FFFFFF));
     }
@@ -78,7 +78,7 @@ uint32_t print_cond_branch(uint32_t instr, uint64_t pc, bool translate, process_
         "eq","ne","cs","cc","mi","pl","vs","vc",
         "hi","ls","ge","lt","gt","le","","invalid"
     };
-    kputfv("%x, %s", target, (uintptr_t)cond_names[cond]);
+    kputfv("%llx, %s", target, cond_names[cond]);
 
     if (!translate) return instr;
     
@@ -88,7 +88,7 @@ uint32_t print_cond_branch(uint32_t instr, uint64_t pc, bool translate, process_
         
     if (!internal) {
         int64_t rel = (int64_t)(target - (destination->code_base_start + new_offset)) >> 2;
-        instr = (instr & 0xFC000000) | (rel & 0x03FFFFFF);
+        instr = (instr & ~(0x7FFFFu << 5)) | ((uint32_t)(rel & 0x7FFFF) << 5);
     }
     return instr;
 }
@@ -107,8 +107,10 @@ uint32_t print_adrp(uint32_t instr, uint64_t pc, bool translate,  process_layout
     uint32_t rd = instr & 0x1F;
     uint64_t immhi = (instr >> 5) & 0x7FFFF;
     uint64_t immlo = (instr >> 29) & 0x3;
-    int64_t offset = ((int64_t)((immhi << 2) | immlo) << 44) >> 32;
-    kputfv("x%i, %x", rd, (pc & ~0xFFFUL) + offset);
+    int64_t imm21 = (int64_t)((immhi << 2) | immlo);
+    imm21 = (imm21 << 43) >> 43;//b
+    int64_t offset = imm21 << 12;
+    kputfv("x%i, %llx", rd, (pc & ~0xFFFUL) + offset);
 
     if (!translate) return instr;
 
@@ -139,7 +141,7 @@ uint32_t print_adrp(uint32_t instr, uint64_t pc, bool translate,  process_layout
 uint32_t print_ldr_str(uint32_t instr, uint64_t pc, bool translate, process_layout *source, process_layout *destination) {
     uint32_t rt = instr & 0x1F;
     uint32_t rn = (instr >> 5) & 0x1F;
-    uint32_t imm = ((instr >> 10) & 0xFFF) << 3;
+    uint32_t imm = ((instr >> 10) & 0xFFF) << (instr >> 30) & 0x3;
     if (rt == 31)
         kputfv("xzr, [x%i]", rn);
     else
@@ -174,7 +176,7 @@ uint32_t print_mov32(uint32_t instr, uint64_t pc, bool translate, process_layout
 
 uint32_t print_movr(uint32_t instr, uint64_t pc, bool translate, process_layout *source, process_layout *destination) {
     uint32_t rd = instr & 0x1F;
-    uint32_t imm16 = (instr >> 15) & 0x1F;
+    uint32_t imm16 = (instr >> 16) & 0x1F;
     kputfv("x%i, x%i", rd, imm16);
     return instr;
 }
@@ -209,7 +211,8 @@ void decode_instruction(uint32_t instruction){
     kprintf("Instruction code %x",instruction);
     for (uint64_t i = 0; i < N_ARR(ops); i++) {
         if ((instruction & ops[i].mask) == ops[i].pattern) {
-            kputf("%s ", (uintptr_t)ops[i].mnemonic);
+            kputf("%s ", ops[i].mnemonic);
+            break;
         }
     }
 }
@@ -217,8 +220,8 @@ void decode_instruction(uint32_t instruction){
 uint32_t parse_instruction(uint32_t instruction, uint64_t pc, bool translate, process_layout *source, process_layout *destination){
     for (uint64_t i = 0; i < N_ARR(ops); i++) {
         if ((instruction & ops[i].mask) == ops[i].pattern) {
-            kputfv("%s ", (uintptr_t)ops[i].mnemonic);
-            uint64_t newinstr = ops[i].reloc(instruction, pc, translate, source, destination);
+            kputfv("%s ", ops[i].mnemonic);
+            uint32_t newinstr = ops[i].reloc(instruction, pc, translate, source, destination);
             return newinstr;
         }
     }
@@ -246,7 +249,7 @@ void relocate_code(void* dst, void* src, uint32_t size, uint64_t src_data_base, 
         .data_size = data_size,
     };
     
-    kprintfv("Beginning translation from base address %x to new address %x", src_base, dst_base);
+    kprintfv("Beginning translation from base address %llx to new address %llx", src_base, dst_base);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t instr = src32[i];
 
@@ -289,7 +292,6 @@ process_t* create_process(const char *name, const char *bundle, program_load_dat
     // kprintf("Code takes %x from %x to %x",code_size, min_addr, max_addr);
 
     uintptr_t *ttbr = mmu_new_ttbr();
-    uintptr_t *kttbr = mmu_default_ttbr();
 
     uintptr_t dest = (uintptr_t)palloc_inner(code_size, MEM_PRIV_USER, MEM_EXEC | MEM_RW, true, false);
     if (!dest) return 0;
@@ -297,7 +299,6 @@ process_t* create_process(const char *name, const char *bundle, program_load_dat
     // kprintf("Allocated space for process between %x and %x",dest,dest+((code_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)));
     
     for (uintptr_t i = min_addr; i < max_addr; i += GRANULE_4KB){
-        mmu_map_4kb(kttbr, (uintptr_t)dest + (i - min_addr), (uintptr_t)dest + (i - min_addr), MAIR_IDX_NORMAL, MEM_EXEC | MEM_RO | MEM_NORM, MEM_PRIV_USER);
         mmu_map_4kb(ttbr, i, (uintptr_t)dest + (i - min_addr), MAIR_IDX_NORMAL, MEM_EXEC | MEM_RO | MEM_NORM, MEM_PRIV_USER);
     }
     memset(PHYS_TO_VIRT_P(dest), 0, code_size);
@@ -323,9 +324,7 @@ process_t* create_process(const char *name, const char *bundle, program_load_dat
     proc->stack_phys = (stack + stack_size);
     
     for (uintptr_t i = stack; i < stack + stack_size; i += GRANULE_4KB){
-        mmu_map_4kb(kttbr, i, i, MAIR_IDX_NORMAL, MEM_RW | MEM_NORM, MEM_PRIV_USER);
         mmu_map_4kb(ttbr, proc->last_va_mapping, i, MAIR_IDX_NORMAL, MEM_RW | MEM_NORM, MEM_PRIV_USER);
-        mmu_map_4kb(ttbr, i, i, MAIR_IDX_NORMAL, MEM_RW | MEM_NORM, MEM_PRIV_USER);
         proc->last_va_mapping += PAGE_SIZE;
     }
     memset(PHYS_TO_VIRT_P(stack), 0, stack_size);
@@ -340,10 +339,8 @@ process_t* create_process(const char *name, const char *bundle, program_load_dat
     proc->heap = proc->last_va_mapping;
     proc->heap_phys = heap;
     mmu_map_4kb(ttbr, proc->last_va_mapping, heap, MAIR_IDX_NORMAL, heapattr | MEM_NORM, MEM_PRIV_USER);
-    mmu_map_4kb(ttbr, heap, heap, MAIR_IDX_NORMAL, heapattr | MEM_NORM, MEM_PRIV_USER);
-    mmu_map_4kb(kttbr, heap, heap, MAIR_IDX_NORMAL, heapattr | MEM_NORM, MEM_PRIV_USER);
 
-    setup_page(PHYS_TO_VIRT(heap), heapattr);
+    setup_page(heap, heapattr);
 
     memset(PHYS_TO_VIRT_P(heap + sizeof(mem_page)), 0, PAGE_SIZE - sizeof(mem_page));
 
@@ -355,12 +352,11 @@ process_t* create_process(const char *name, const char *bundle, program_load_dat
 
     proc->sp = proc->stack;
     
-    proc->output = PHYS_TO_VIRT((uintptr_t)palloc_inner(PROC_OUT_BUF, MEM_PRIV_USER, MEM_RW, true, false));
-    for (uintptr_t i = proc->output; i < proc->output + PROC_OUT_BUF; i += GRANULE_4KB)
-        mmu_map_4kb(kttbr, i, i, MAIR_IDX_NORMAL, MEM_RW | MEM_NORM, MEM_PRIV_USER);
-    memset(PHYS_TO_VIRT_P(proc->output), 0, PAGE_SIZE);
+    proc->output = (uintptr_t)palloc(PROC_OUT_BUF, MEM_PRIV_KERNEL, MEM_RW, true);
+    if (!proc->output) return 0;
+    proc->output_size = 0;
     proc->pc = (uintptr_t)(entry);
-    kprintf("User process %s allocated with address at %llx, stack at %llx (%llx), heap at %llx (%llx)",(uintptr_t)name,proc->pc, proc->sp, proc->stack_phys, proc->heap, proc->heap_phys);
+    kprintf("User process %s allocated with address at %llx, stack at %llx (%llx), heap at %llx (%llx)",name,proc->pc, proc->sp, proc->stack_phys, proc->heap, proc->heap_phys);
     proc->spsr = 0;
     proc->state = BLOCKED;
     

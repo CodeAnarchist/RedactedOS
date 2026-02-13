@@ -37,7 +37,8 @@
 #include "exceptions/timer.h"
 #include "syscalls/syscalls.h"
 
-
+#include "memory/page_allocator.h"
+#include "memory/mmu.h"
 
 static int udp_probe_server(uint32_t probe_ip, uint16_t probe_port, net_l4_endpoint *out_l4) {
     socket_handle_t sock = udp_socket_create(SOCK_ROLE_CLIENT, (uint16_t)get_current_proc_pid(), NULL);
@@ -95,6 +96,8 @@ static void free_request(HTTPRequestMsg *req) {
 
 
 static void run_http_server() {
+    //mmu_enable_verbose();
+    //page_alloc_enable_verbose();
     uint16_t pid = get_current_proc_pid();
     SocketExtraOptions opt = {0};
     opt.debug_level = SOCK_DBG_ALL;

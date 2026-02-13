@@ -16,8 +16,9 @@
 
 void* malloc(size_t size){
     process_t* k = get_proc_by_pid(1);
-    uintptr_t heap_pa = mmu_translate(k->heap);
-    if (!heap_pa) return 0;
+    int tr;
+    uintptr_t heap_pa = mmu_translate(k->heap, &tr);
+    if (tr) return 0;
     return kalloc((void*)heap_pa, size, ALIGN_16B, MEM_PRIV_KERNEL);
 }
 

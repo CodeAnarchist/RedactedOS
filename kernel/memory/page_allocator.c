@@ -17,7 +17,49 @@
 
 #define PAGE_TABLE_ENTRIES 65536
 
+#define LOW_ADDR_WARN 0x100000ULL
+
+#define ALLOC_TAG_MAGIC 0xCCDEC00ED00DAA0EULL
+#define ALLOC_TAG_MAGIC_INV (~ALLOC_TAG_MAGIC)
+#define ALLOC_TAG_SIZE 64
+#define ALLOC_KIND_SMALL 1
+
+typedef struct {
+    uint64_t magic;
+    uint64_t magic_inv;
+    uint64_t base_phys;
+    uint64_t user_phys;
+    uint64_t owner_phys;
+    uint32_t alloc_size;
+    uint32_t user_size;
+    uint16_t alignment;
+    uint8_t kind;
+    uint8_t level;
+    uint8_t attributes;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t checksum;
+    uint32_t checksum_inv;
+} alloc_tag;
+
+typedef struct {
+    uint64_t phys_base;
+    uint64_t size;
+    uint64_t owner_phys;
+} big_alloc_entry;
+
+#define BIG_ALLOC_ENTRIES ((PAGE_SIZE - 16) / sizeof(big_alloc_entry))
+
+typedef struct big_alloc_page {
+    struct big_alloc_page* next;
+    uint32_t count;
+    uint32_t pad;
+    big_alloc_entry entries[BIG_ALLOC_ENTRIES];
+} big_alloc_page;
+
+
 uintptr_t *mem_bitmap;
+static big_alloc_page* big_alloc_meta = 0;
 
 static bool page_alloc_verbose = false;
 
@@ -51,22 +93,38 @@ void pfree(void* ptr, uint64_t size) {
         uint64_t table_index = index/64;
         uint64_t table_offset = index % 64;
         mem_bitmap[table_index] &= ~(1ULL << table_offset);
-        mmu_unmap(index * PAGE_SIZE, index * PAGE_SIZE);
     }
 }
 
-void free_page_list(page_index *index){
-    if (index->header.next) free_page_list(index->header.next);
-    for (size_t i = 0; i < index->header.size; i++)
-        pfree(index->ptrs[i].ptr, index->ptrs[i].size);
-}
-
 void free_managed_page(void* ptr){
+    if (!ptr) return;
+
+    uintptr_t owner_phys = (uintptr_t)ptr;
+    if ((owner_phys & HIGH_VA) == HIGH_VA) owner_phys = VIRT_TO_PHYS(owner_phys);
+    owner_phys &= ~0xFFFULL;
+
+    big_alloc_page* mp = big_alloc_meta;
+    while (mp){
+        for (uint32_t i = 0; i < mp->count;){
+            if (mp->entries[i].owner_phys != owner_phys){
+                i++;
+                continue;
+            } 
+
+            uint64_t phys_base = mp->entries[i].phys_base;
+            uint64_t size = mp->entries[i].size;
+
+            mp->count--;
+            mp->entries[i] = mp->entries[mp->count];
+
+            pfree(PHYS_TO_VIRT_P((void*)phys_base), size);
+        }
+        mp = mp->next;
+    }
+
     mem_page *info = (mem_page*)ptr;
     if (info->next)
         free_managed_page(info->next);
-    if (info->page_alloc)
-        free_page_list(info->page_alloc);
     pfree((void*)ptr, PAGE_SIZE);
 }
 
@@ -98,8 +156,11 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
         uint64_t reg_count = page_count/64;
         uint8_t fractional = page_count % 64;
         reg_count += fractional > 0;
-        
+        uint64_t align_regs = 1;
+        if (size >= GRANULE_2MB && (size & (GRANULE_2MB - 1)) == 0) align_regs = GRANULE_2MB / (PAGE_SIZE * 64);
+
         for (uint64_t i = start/64; i < end/64; i++) {
+            if (align_regs > 1 && (i % align_regs) != 0) continue;
             bool found = true;
             for (uint64_t j = 0; j < reg_count; j++){
                 if (fractional && j == reg_count-1)
@@ -116,8 +177,9 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
                     else
                         mem_bitmap[i+j] = UINT64_MAX;
                 }
-                
-                start = (i + (reg_count - (fractional > 0))) * 64;
+
+                start = (i * 64) + page_count;
+                mem_page* prev_page = 0;
                 for (uint32_t p = 0; p < page_count; p++){
                     uintptr_t address = ((i * 64) + p) * PAGE_SIZE;
                     if (map){
@@ -125,12 +187,21 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
                             register_device_memory(address, address);
                         else
                             register_proc_memory(address, address, attributes, level);
+                        if (!full){
+                            setup_page(address, attributes);
+
+                            mem_page* curr = (mem_page*)PHYS_TO_VIRT(address);
+                            if (prev_page) prev_page->next = curr;
+                            prev_page = curr;
+
+                            memset((void*)PHYS_TO_VIRT(address +sizeof(mem_page)), 0, PAGE_SIZE - sizeof(mem_page));
+                        } else {
+                            memset((void*)PHYS_TO_VIRT(address), 0, PAGE_SIZE);
+                        }
                     }
                 }
                 kprintfv("[page_alloc] Final address %x", (i * 64 * PAGE_SIZE));
-                void* addr = (void*)(i * 64 * PAGE_SIZE);
-                if (map) memset(PHYS_TO_VIRT_P(addr), 0, size);
-                return addr;
+                return (void*)(i * 64 * PAGE_SIZE);
             }
         }
     }
@@ -163,6 +234,8 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
             }
             
             uintptr_t first_address = 0;
+            mem_page* prev_page = 0;
+
             for (uint64_t j = 0; j < page_count; j++){
                 mem_bitmap[i] |= (1ULL << (bit + j));
                 uint64_t page_index = (i * 64) + (bit + j);
@@ -174,18 +247,21 @@ void* palloc_inner(uint64_t size, uint8_t level, uint8_t attributes, bool full, 
                         register_device_memory(address, address);
                     else
                         register_proc_memory(address, address, attributes, level);
-                }
 
-                if (!full && map) {
-                    setup_page(address, attributes);
+                    if (!full) {
+                        setup_page(address, attributes);
+                        mem_page* curr = (mem_page*)PHYS_TO_VIRT(address);
+                        if (prev_page) prev_page->next = curr;
+                        prev_page = curr;
+
+                        memset((void*)PHYS_TO_VIRT(address + sizeof(mem_page)), 0, PAGE_SIZE - sizeof(mem_page));
+                    } else {
+                        memset((void*)PHYS_TO_VIRT(address), 0, PAGE_SIZE);
+                    }
                 }
             }
 
             kprintfv("[page_alloc] Final address %x", first_address);
-            if (map){
-                size_t extra = full ? 0 : sizeof(mem_page);
-                memset((void*)PHYS_TO_VIRT((first_address + extra)),0,size - extra);
-            } 
             return (void*)first_address;
         } else if (!skipped_regs) start = (i + 1) * 64;
     }
@@ -228,131 +304,313 @@ void mark_used(uintptr_t address, size_t pages)
         mem_bitmap[i] |= (1ULL << bit);
     }
 }
-
-#define PAGE_INDEX_LIMIT (PAGE_SIZE-sizeof(page_index_hdr))/sizeof(page_index_entry)
-
+//TODO: we're changing the size but not reporting it back, which means the free function does not fully free the allocd memory
 //TODO: maybe alloc to different base pages based on alignment? Then it's easier to keep track of full pages, freeing and sizes
 void* kalloc_inner(void *page, size_t size, uint16_t alignment, uint8_t level, uintptr_t page_va, uintptr_t *next_va, uintptr_t *ttbr){
-    //TODO: we're changing the size but not reporting it back, which means the free function does not fully free the allocd memory
-    if (!page) return 0;
-    size = (size + alignment - 1) & ~(alignment - 1);
+    if (!page || !size) return 0;
+    if (!alignment || (alignment & (alignment - 1))) {
+        kprintfv("[kalloc] bad alignment %x", alignment);
+        return 0;
+    }
 
-    kprintfv("[in_page_alloc] Requested size: %x", size);
+    if ((uintptr_t)page < LOW_ADDR_WARN) kprintfv("[kalloc an] low page=%llx size=%llx align=%x", (uint64_t)(uintptr_t)page, (uint64_t)size, (uint32_t)alignment);
+
+    size_t req_size = size;
+    if (size & 0xFULL) size = (size + 15) & ~0xFULL;
 
     mem_page *info = (mem_page*)PHYS_TO_VIRT_P(page);
+
+    uintptr_t owner_phys = (uintptr_t)page;
+    if ((owner_phys & HIGH_VA) == HIGH_VA) owner_phys = VIRT_TO_PHYS(owner_phys);
+    owner_phys &= ~0xFFFULL;
+
     if (!info->next_free_mem_ptr){
         uintptr_t page_phys = (uintptr_t)page;
         if ((page_phys & HIGH_VA) == HIGH_VA) page_phys = VIRT_TO_PHYS(page_phys);
-        setup_page(page_phys, info->attributes);
-
+        page_phys &= ~0xFFFULL;
+        setup_page(page_phys, info->attributes);//b
         info = (mem_page*)PHYS_TO_VIRT_P((void*)page_phys);
     }
-    
-    if (size >= PAGE_SIZE){
-        void* ptr = palloc(size, level, info->attributes, true);
-        page_index *index = info->page_alloc;
-        if (!index){
-            info->page_alloc = palloc(PAGE_SIZE, level, info->attributes, true);
-            index = info->page_alloc;
+
+    size_t small_need = ALLOC_TAG_SIZE + size + (alignment - 1);
+    if (small_need & 0xFULL) small_need = (small_need + 15) & ~0xFULL;
+
+    if (size >= PAGE_SIZE || alignment >= PAGE_SIZE || small_need >= PAGE_SIZE) {
+        uint64_t alloc_size = size;
+        if (alloc_size & (alignment - 1)) alloc_size = (alloc_size + alignment - 1) & ~(alignment - 1);
+        alloc_size = (alloc_size + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+
+        void* ptr = palloc(alloc_size, level, info->attributes, true);//b
+        if (!ptr) return 0;
+
+        uintptr_t phys_base = VIRT_TO_PHYS((uintptr_t)ptr);
+
+        big_alloc_page* mp = big_alloc_meta;
+        while (mp && mp->count >= BIG_ALLOC_ENTRIES)
+            mp = mp->next;
+
+        if (!mp) {
+            void* meta_phys =palloc_inner(PAGE_SIZE, MEM_PRIV_KERNEL, MEM_RW, true, true);
+            if (!meta_phys) panic("kalloc no metadata page", alloc_size);
+            mp = (big_alloc_page*)PHYS_TO_VIRT_P(meta_phys);
+            memset(mp, 0, PAGE_SIZE);
+            mp->next = big_alloc_meta;
+            big_alloc_meta = mp;
         }
-        while (index->header.next) {
-            index = index->header.next;
-        }
-        if (index->header.size >= PAGE_INDEX_LIMIT){
-            index->header.next = palloc(PAGE_SIZE, level, info->attributes, true);
-            index = index->header.next;
-        }
-        index->ptrs[index->header.size].ptr = ptr;
-        index->ptrs[index->header.size++].size = size;
+
+        mp->entries[mp->count].phys_base = phys_base;
+        mp->entries[mp->count].size = alloc_size;
+        mp->entries[mp->count].owner_phys = owner_phys;
+        mp->count++;
+
         if (page_va && next_va && ttbr){
             uintptr_t va = *next_va;
-            for (uintptr_t i = (uintptr_t)ptr; i < (uintptr_t)ptr + size; i+= GRANULE_4KB){
-                mmu_map_4kb(ttbr, *next_va, (uintptr_t)i, (info->attributes & MEM_DEV) ? MAIR_IDX_DEVICE : MAIR_IDX_NORMAL, info->attributes, level);
+            for (uint64_t i = 0; i < alloc_size; i+= GRANULE_4KB){
+                mmu_map_4kb(ttbr, *next_va, phys_base + i, (info->attributes & MEM_DEV) ? MAIR_IDX_DEVICE : MAIR_IDX_NORMAL, info->attributes, level);
                 *next_va += PAGE_SIZE;
             }
             return (void*)va;
         }
+        memset((void*)PHYS_TO_VIRT(phys_base), 0, alloc_size);
         return ptr;
     }
 
     FreeBlock** curr = PHYS_TO_VIRT_P(&info->free_list);
+    if (info->free_list && (uintptr_t)info->free_list < LOW_ADDR_WARN)
+        kprintfv("[kalloc an] free_list low head=%llx page=%llx", (uint64_t)(uintptr_t)info->free_list, (uint64_t)(uintptr_t)page);
+
     FreeBlock *cblock = PHYS_TO_VIRT_P(*curr);
     while (*curr && ((uintptr_t)*curr & 0xFFFFFFFF) != 0xDEADBEEF && (uintptr_t)cblock != 0xDEADBEEF && (uintptr_t)cblock != 0xDEADBEEFDEADBEEF) {
-        if (cblock->size >= size) {
-            kprintfv("[in_page_alloc] Reusing free block at %x",(uintptr_t)*curr);
+        uintptr_t base_phys = (uintptr_t)*curr;
+        uint64_t bsz = cblock->size;
 
-            uint64_t result = (uint64_t)cblock;
-            //*curr = VIRT_TO_PHYS_P(cblock->next);
-            *curr = cblock->next;
-            memset((void*)PHYS_TO_VIRT(result), 0, size);
-            info->size += size;
-            if (page_va){
-                return (void*)(page_va | (result & 0xFFF));
-            } 
-            return (void*)result;
+        if (bsz >= small_need) {
+            uintptr_t user_phys = base_phys + ALLOC_TAG_SIZE;
+            if (user_phys & (alignment - 1)) user_phys = (user_phys + alignment - 1) & ~(uintptr_t)(alignment - 1);
+            uintptr_t tag_phys = user_phys - ALLOC_TAG_SIZE;
+
+            if (user_phys + size <= base_phys + bsz) {
+                *curr = cblock->next;
+
+                alloc_tag* tag = (alloc_tag*)PHYS_TO_VIRT(tag_phys);
+                tag->magic = ALLOC_TAG_MAGIC;
+                tag->magic_inv = ALLOC_TAG_MAGIC_INV;
+                tag->base_phys = base_phys;
+                tag->user_phys = user_phys;
+                tag->owner_phys = owner_phys;
+                tag->alloc_size = (uint32_t)bsz;
+                tag->user_size = (uint32_t)req_size;
+                tag->alignment = alignment;
+                tag->kind = ALLOC_KIND_SMALL;
+                tag->level = level;
+                tag->attributes = info->attributes;
+                tag->reserved0 = 0;
+                tag->reserved1 = 0;
+
+                uint64_t mix = tag->base_phys ^ tag->user_phys ^ tag->owner_phys ^ ((uint64_t)tag->alloc_size << 32) ^ tag->user_size;
+                mix ^= ((uint64_t)tag->alignment << 48) ^ ((uint64_t)tag->kind << 40) ^ ((uint64_t)tag->level << 32) ^ ((uint64_t)tag->attributes << 24);
+                mix ^= ALLOC_TAG_MAGIC; //token
+                uint32_t c = (uint32_t)(mix ^ (mix >> 32));
+                tag->checksum = c;
+                tag->checksum_inv = ~c;
+
+                memset((void*)PHYS_TO_VIRT(user_phys), 0, size);
+                info->size += bsz;
+                if (page_va) return(void*)(page_va | (user_phys & 0xFFF));
+                return (void*)user_phys;
+            }
         }
-        kprintfv("-> %x",(uintptr_t)&cblock->next);
-        curr = &(cblock)->next;
+
+        curr = &cblock->next;
         cblock = PHYS_TO_VIRT_P(*curr);
     }
 
+    uintptr_t page_phys = (uintptr_t)page;
+    if ((page_phys & HIGH_VA) == HIGH_VA) page_phys = VIRT_TO_PHYS(page_phys);
+    page_phys &= ~0xFFFULL;
+
+    uintptr_t base_phys = info->next_free_mem_ptr;
+    if (base_phys & 0xFULL) base_phys = (base_phys + 15) & ~0xFULL;
     kprintfv("[in_page_alloc] Current next pointer %llx",info->next_free_mem_ptr);
 
-    info->next_free_mem_ptr = (info->next_free_mem_ptr + alignment - 1) & ~(alignment - 1);
+    uintptr_t user_phys = base_phys + ALLOC_TAG_SIZE;
+    if (user_phys & (alignment - 1)) user_phys = (user_phys + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    uintptr_t tag_phys = user_phys - ALLOC_TAG_SIZE;
 
-    kprintfv("[in_page_alloc] Aligned next pointer %llx",info->next_free_mem_ptr);
-
-    if (info->next_free_mem_ptr + size > ((VIRT_TO_PHYS((uintptr_t)page)) + PAGE_SIZE)) {
+    if (base_phys + small_need > page_phys + PAGE_SIZE) {
         if (!info->next){
             info->next = palloc(PAGE_SIZE, level, info->attributes, false);
             if (page_va && next_va && ttbr){
-                mmu_map_4kb(ttbr, *next_va, (uintptr_t)info->next, (info->attributes & MEM_DEV) ? MAIR_IDX_DEVICE : MAIR_IDX_NORMAL, info->attributes, level);
+                uintptr_t phys_next = VIRT_TO_PHYS((uintptr_t)info->next);
+                register_proc_memory((uintptr_t)*next_va, phys_next, info->attributes, level);
                 *next_va += PAGE_SIZE;
             }
             kprintfv("[in_page_alloc] Page %llx points to new page %llx",page,info->next);
         }
-        kprintfv("[in_page_alloc] Page full. Moving to %x",(uintptr_t)info->next);
-        return kalloc_inner(info->next, size, alignment, level, page_va ? page_va + PAGE_SIZE : 0, next_va, ttbr);
+        return kalloc_inner(info->next, req_size, alignment, level, page_va ? page_va + PAGE_SIZE : 0, next_va, ttbr);
     }
 
-    uint64_t result = info->next_free_mem_ptr;
-    info->next_free_mem_ptr += size;
+    info->next_free_mem_ptr = base_phys + small_need;
 
-    kprintfv("[in_page_alloc] Allocated address %x",result);
+    alloc_tag* tag = (alloc_tag*)PHYS_TO_VIRT(tag_phys);
+    tag->magic = ALLOC_TAG_MAGIC;
+    tag->magic_inv = ALLOC_TAG_MAGIC_INV;
+    tag->base_phys = base_phys;
+    tag->user_phys = user_phys;
+    tag->owner_phys = owner_phys;
+    tag->alloc_size = (uint32_t)small_need;
+    tag->user_size = (uint32_t)req_size;
+    tag->alignment = alignment;
+    tag->kind = ALLOC_KIND_SMALL;
+    tag->level = level;
+    tag->attributes = info->attributes;
+    tag->reserved0 = 0;
+    tag->reserved1 = 0;
 
-    memset((void*)PHYS_TO_VIRT(result), 0, size);
-    info->size += size;
+    uint64_t mix = tag->base_phys ^ tag->user_phys ^ tag->owner_phys ^ ((uint64_t)tag->alloc_size << 32) ^ tag->user_size;
+    mix ^= ((uint64_t)tag->alignment << 48) ^ ((uint64_t)tag->kind << 40) ^ ((uint64_t)tag->level << 32) ^ ((uint64_t)tag->attributes << 24);
+    mix ^= ALLOC_TAG_MAGIC;
+    uint32_t c = (uint32_t)(mix ^ (mix >> 32));
+    tag->checksum = c;
+    tag->checksum_inv = ~c;
+
+    memset((void*)PHYS_TO_VIRT(user_phys), 0, size);
+    info->size += small_need;
+    kprintfv("[in_page_alloc] Allocated address %x",user_phys);
+
     if (page_va){
-        return (void*)(page_va | (result & 0xFFF));
+        return (void*)(page_va | (user_phys & 0xFFF));
     }
-    return (void*)result;
+    return (void*)user_phys;
 }
 
-//TODO: rather than kalloc, it should be palloc that does translations
 void* kalloc(void *page, size_t size, uint16_t alignment, uint8_t level){
     void* ptr = kalloc_inner(page, size, alignment, level, 0, 0, 0);
-    if (level == MEM_PRIV_KERNEL) ptr = PHYS_TO_VIRT_P(ptr);
+    if (level == MEM_PRIV_KERNEL && ptr) ptr = PHYS_TO_VIRT_P(ptr);
     return ptr;
 }
 
 void kfree(void* ptr, size_t size) {
-    if(!ptr || size == 0) return;
+    if(!ptr) return;
     kprintfv("[page_alloc_free] Freeing block at %x size %x",(uintptr_t)ptr, size);
 
-    if(size & 0xF) size = (size + 15) & ~0xFULL;
+    uintptr_t va = (uintptr_t)ptr;
+    uintptr_t phys = 0;
 
-    memset32((void*)ptr,0xDEADBEEF,size);
+    if((va & HIGH_VA) == HIGH_VA){
+        phys = VIRT_TO_PHYS(va);
+    } else {
+        int tr = 0;
+        phys = mmu_translate(va, &tr);
+        if(tr){
+            kprintf("[kfree] unmapped ptr=%llx size=%llx", (uint64_t)va, (uint64_t)size);
+            panic("kfree unmapped pointer", va);
+        }
+    }
 
-    mem_page *page = (mem_page *)(((uintptr_t)ptr) & ~0xFFFULL);
-    uintptr_t phys_page = mmu_translate((uintptr_t)page);
-    uintptr_t off = (uintptr_t)ptr & 0xFFFULL;
-    uintptr_t block_phys = phys_page | off;
+    uintptr_t phys_base = phys& ~0xFFFULL;
+    uint64_t page_off = va & 0xFFFULL;
 
-    FreeBlock* block = (FreeBlock*)PHYS_TO_VIRT(block_phys);
-    block->size = size;
-    block->next = page->free_list;
-    page->free_list = (FreeBlock*)block_phys;
-    page->size -= size;
+    bool tag_ok = false;
+    alloc_tag* tag = 0;
+
+    if(page_off >= ALLOC_TAG_SIZE) {
+        uintptr_t phys_tag = 0;
+        if((va & HIGH_VA) == HIGH_VA) {
+            phys_tag = VIRT_TO_PHYS(va - ALLOC_TAG_SIZE);
+        } else {
+            int tr = 0;
+            phys_tag = mmu_translate(va - ALLOC_TAG_SIZE, &tr);
+            if(tr) phys_tag = 0;
+        }
+
+        if(phys_tag) {
+            tag = (alloc_tag*)PHYS_TO_VIRT(phys_tag);
+            if(tag->magic == ALLOC_TAG_MAGIC && tag->magic_inv == ALLOC_TAG_MAGIC_INV && tag->user_phys == phys){
+                uint64_t mix = tag->base_phys ^ tag->user_phys ^ tag->owner_phys ^ ((uint64_t)tag->alloc_size << 32) ^ tag->user_size;
+                mix ^= ((uint64_t)tag->alignment << 48) ^ ((uint64_t)tag->kind << 40) ^ ((uint64_t)tag->level << 32) ^ ((uint64_t)tag->attributes << 24);
+                mix ^= ALLOC_TAG_MAGIC; //token
+                uint32_t c = (uint32_t)(mix ^ (mix >> 32));
+                if(tag->checksum == c && tag->checksum_inv == ~c) tag_ok = true;
+            }
+        }
+    }
+
+    if(tag_ok) {
+        if(tag->kind != ALLOC_KIND_SMALL) {
+            kprintf("[kfree] bad tag kind ptr=%llx phys=%llx kind=%u size=%llx", (uint64_t)va, (uint64_t)phys, (unsigned)tag->kind, (uint64_t)size);
+            panic("kfree bad tag kind", va);
+        }
+
+        uintptr_t base_phys = (uintptr_t)tag->base_phys;
+        uint64_t alloc_size = tag->alloc_size;
+
+        if(!alloc_size || alloc_size >= PAGE_SIZE) {
+            kprintf("[kfree] bad small size ptr=%llx phys=%llx base=%llx alloc=%llx", (uint64_t)va, (uint64_t)phys, (uint64_t)base_phys, alloc_size);
+            panic("kfree bad small alloc size", base_phys);
+        }
+
+        uintptr_t page_phys = base_phys & ~0xFFFULL;
+        mem_page *page = (mem_page *)PHYS_TO_VIRT(page_phys);
+
+        memset32((void*)PHYS_TO_VIRT(base_phys),0xDEADBEEF,alloc_size);
+        FreeBlock* block = (FreeBlock*)PHYS_TO_VIRT( base_phys);
+        block->size = alloc_size;
+        block->next = page->free_list;
+        page->free_list = (FreeBlock*)base_phys;
+
+        if(page->size >= alloc_size) page->size -= alloc_size;
+        else page->size = 0;
+
+        return;
+    }
+
+    if(page_off != 0) {
+        kprintf("[kfree] untracked ptr=%llx phys=%llx size=%llx off=%llx", (uint64_t)va, (uint64_t)phys, (uint64_t)size, page_off);
+        panic("kfree untracked pointer", va);
+    }
+
+    big_alloc_page* mp = big_alloc_meta;
+    while(mp) {
+        for(uint32_t i = 0; i < mp->count; i++)  {
+            if(mp->entries[i].phys_base != phys_base) continue;
+
+            if(mp->entries[i].phys_base != phys) {
+                kprintf("[kfree] non base big ptr=%llx phys=%llx base=%llx", (uint64_t)va, (uint64_t)phys, (uint64_t)phys_base);
+                panic("kfree non base big pointer", va);
+            }
+
+            uint64_t big_size = mp->entries[i].size;
+            mp->count--;
+            mp->entries[i] = mp->entries[mp->count];
+
+            if(!mem_bitmap) {
+                kprintf("[kfree] bitmap not init ptr=%llx phys=%llx", (uint64_t)va, (uint64_t)phys);
+                panic("kfree bitmap not init", va);
+            }
+
+            uintptr_t va_base = va & ~0xFFFULL;
+            uint64_t pages = count_pages(big_size, PAGE_SIZE);
+
+            for(uint64_t p = 0; p < pages; p++) {
+                uintptr_t pa = phys_base + (p*PAGE_SIZE);
+                uintptr_t va_p = va_base + (p*PAGE_SIZE);
+
+
+                uint64_t page_idx = pa / PAGE_SIZE;
+                uint64_t table_index = page_idx / 64;
+                uint64_t table_offset = page_idx % 64;
+
+                mem_bitmap[table_index] &= ~(1ULL << table_offset);
+            }
+
+            return;
+        }
+        mp = mp->next;
+    }
+
+    kprintf("[kfree] page pointer not tracked ptr=%llx phys=%llx size=%llx", (uint64_t)va, (uint64_t)phys, (uint64_t)size);
+    panic("kfree page pointer not tracked (use pfree)", phys);
 }
 
 void free_sizedptr(sizedptr ptr){

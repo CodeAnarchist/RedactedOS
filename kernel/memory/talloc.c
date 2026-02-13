@@ -58,7 +58,7 @@ uintptr_t pre_talloc_mem_limit = 0;
 bool can_automap = false;
 
 void pre_talloc(){
-    pre_talloc_ptr = palloc_inner(GRANULE_2MB, MEM_PRIV_KERNEL, MEM_DEV | MEM_RW, true, can_automap);
+    pre_talloc_ptr = palloc_inner(GRANULE_2MB, MEM_PRIV_KERNEL, MEM_RW, true, can_automap);
     pre_talloc_mem_limit = (uintptr_t)pre_talloc_ptr + GRANULE_2MB;
 
     if (!can_automap){

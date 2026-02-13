@@ -127,7 +127,7 @@ void reset_process(process_t *proc){
         pfree(proc->code, proc->code_size);
     }
     if (!just_finished && proc->output)
-        kfree((void*)proc->output, PROC_OUT_BUF);
+        pfree((void*)proc->output, PROC_OUT_BUF);
     for (int j = 0; j < 31; j++)
         proc->regs[j] = 0;
     for (int k = 0; k < MAX_PROC_NAME_LENGTH; k++)
@@ -162,6 +162,7 @@ void init_main_process(){
     proc->id = next_proc_index++;
     proc->state = BLOCKED;
     proc->heap = (uintptr_t)palloc(0x1000, MEM_PRIV_KERNEL, MEM_RW, false);
+    proc->heap_phys = VIRT_TO_PHYS(proc->heap);
     proc->stack_size = 0x10000;
     proc->stack = (uintptr_t)palloc(proc->stack_size,MEM_PRIV_KERNEL, MEM_RW,true);
     proc->sp = ksp;
