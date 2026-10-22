@@ -15,6 +15,7 @@ extern "C" {
 #define DNS_CLASS_MASK 0x7FFF
 
 #define DNS_FLAG_QR 0x8000
+#define DNS_FLAG_TC 0x0200
 #define DNS_FLAG_AA 0x0400
 #define DNS_FLAG_RD 0x0100
 #define DNS_OPCODE_MASK 0x7800

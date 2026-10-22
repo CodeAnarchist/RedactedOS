@@ -1,9 +1,7 @@
 #include "dhcpv6_daemon.h"
 
 #include "std/memory.h"
-#include "std/string.h"
 #include "syscalls/syscalls.h"
-#include "process/scheduler.h"
 #include "kernel_processes/kprocess_loader.h"
 #include "exceptions/irq.h"
 #include "math/rng.h"
@@ -16,7 +14,6 @@
 #include "networking/network.h"
 
 #include "networking/application_layer/dhcpv6.h"
-#include "networking/internet_layer/ipv6.h"
 #include "networking/internet_layer/ipv6_utils.h"
 
 #include "networking/transport_layer/csocket.h"
@@ -471,10 +468,8 @@ static void fsm_once(dhcpv6_bind_t* b, uint32_t tick_ms, bool force_renew, bool 
             if (!p.has_server_id || !p.has_client_id || p.client_id_len != 10) continue;
 
             uint8_t duid[10];
-            uint16_t duid_type = bswap16(3);
-            uint16_t hw_type = bswap16(1);
-            memcpy(duid, &duid_type, 2);
-            memcpy(duid + 2, &hw_type, 2);
+            wr_be16(duid, 3);
+            wr_be16(duid + 2, 1);
             mac_copy(duid + 4, b->mac);
             if (memcmp(duid, p.client_id, sizeof(duid)) != 0) continue;
 
@@ -700,7 +695,7 @@ static void fsm_once(dhcpv6_bind_t* b, uint32_t tick_ms, bool force_renew, bool 
     dst.ver = IP_VER6;
     ipv6_make_multicast(2, IPV6_MCAST_DHCPV6_SERVERS, NULL, dst.ip);
     dst.port = DHCPV6_SERVER_PORT;
-    if (send_to_socket(b->sock, &dst, msg, msg_len) >= 0) b->rx_fast_left_ms = 1000;
+    if (send_to_socket(b->sock, &dst, msg, msg_len) == msg_len) b->rx_fast_left_ms = 1000;
     b->tx_tries++;
 
     uint32_t initial_rt = 0;

@@ -1,6 +1,5 @@
 #include "dns_daemon.h"
 #include "mdns_internal.h"
-#include "process/scheduler.h"
 #include "kernel_processes/kprocess_loader.h"
 #include "exceptions/irq.h"
 #include "syscalls/syscalls.h"

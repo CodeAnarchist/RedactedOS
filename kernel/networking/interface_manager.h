@@ -171,6 +171,7 @@ bool l3_ipv6_remove_from_interface(l3_id_t l3_id);
 l3_ipv6_interface_t *l3_ipv6_find_by_id(l3_id_t l3_id);
 l3_ipv6_interface_t *l3_ipv6_find_by_ip(const uint8_t ip[16]);
 uint16_t l3_ipv6_effective_mtu(const l3_ipv6_interface_t *l3);
+uint32_t l3_epoch(l3_id_t l3_id);
 bool l2_ipv6_set_link_mtu(uint8_t ifindex, uint16_t mtu);
 
 void l3_init_localhost_ipv4(void);

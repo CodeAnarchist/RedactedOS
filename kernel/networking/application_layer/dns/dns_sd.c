@@ -1,5 +1,6 @@
 #include "dns_sd.h"
-#include "std/std.h"
+#include "std/string.h"
+#include "std/memory.h"
 
 uint32_t dns_sd_add_rr_ptr(uint8_t* out, uint32_t cap, uint32_t off, const char* name, uint16_t rrclass, uint32_t ttl_s, const char *target) {
     if (!dns_wire_write_name(out, cap, &off, name)) return 0;
@@ -34,9 +35,7 @@ uint32_t dns_sd_add_rr_a(uint8_t* out, uint32_t cap, uint32_t off, const char* n
     off = dns_wire_put_u16(out, cap, off, 4);
     if(!off) return 0;
 
-    if(off + 4 > cap) return 0;
-    wr_be32(out + off, ip);
-    return off + 4;
+    return dns_wire_put_u32(out, cap, off, ip);
 }
 
 uint32_t dns_sd_add_rr_aaaa(uint8_t* out, uint32_t cap, uint32_t off, const char* name, uint16_t rrclass,uint32_t ttl_s, const uint8_t ip6[16]) {
@@ -51,7 +50,7 @@ uint32_t dns_sd_add_rr_aaaa(uint8_t* out, uint32_t cap, uint32_t off, const char
     off = dns_wire_put_u16(out, cap, off, 16);
     if(!off) return 0;
 
-    if(off + 16 > cap) return 0;
+    if(off > cap || cap - off < 16) return 0;
     memcpy(out + off, ip6, 16);
     return off + 16;
 }
@@ -125,7 +124,7 @@ uint32_t dns_sd_add_rr_txt(uint8_t *out, uint32_t cap, uint32_t off, const char 
             uint32_t len = (uint32_t)(p - start);
             if(len > 255) len = 255;
 
-            if(off + 1 + len > cap) return 0;
+            if(off > cap || cap - off < 1 + len) return 0;
             out[off] = (uint8_t)len;
             off++;
             memcpy(out + off, start,len);
@@ -133,6 +132,11 @@ uint32_t dns_sd_add_rr_txt(uint8_t *out, uint32_t cap, uint32_t off, const char 
 
             while(is_whitespace(*p) || *p == ';') p++;
         }
+    }
+
+    if (off == rdata_start) {
+        if (off >= cap) return 0;
+        out[off++] = 0;
     }
 
     uint16_t rdlen = (uint16_t)(off - rdata_start);

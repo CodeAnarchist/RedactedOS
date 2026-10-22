@@ -2,9 +2,7 @@
 #include "dns_mdns.h"
 #include "dns_cache.h"
 #include "std/memory.h"
-#include "std/string.h"
 #include "types.h"
-#include "networking/internet_layer/ipv4.h"
 #include "networking/internet_layer/ipv4_utils.h"
 #include "networking/internet_layer/ipv6_utils.h"
 
@@ -36,7 +34,7 @@ static dns_result_t perform_dns_query_once(socket_handle_t sock, const net_l4_en
     dst.port = 53;
 
     int64_t sent = send_to_socket(sock, &dst, (void*)request_buffer, request_len);
-    if (sent < 0) return DNS_ERR_SEND;
+    if (sent != request_len) return DNS_ERR_SEND;
 
     uint32_t waited_ms = 0;
     while (waited_ms < timeout_ms){
@@ -48,12 +46,14 @@ static dns_result_t perform_dns_query_once(socket_handle_t sock, const net_l4_en
             dns_record_t parsed[DNS_QUERY_RECORDS];
             uint32_t parsed_count = 0;
             uint16_t flags = 0;
-            if (!dns_wire_parse_records(response_buffer, received_len, true, message_id, parsed, DNS_QUERY_RECORDS, &parsed_count, &flags)) {
+            if (!dns_wire_parse_records(response_buffer, received_len, true, message_id, parsed, DNS_QUERY_RECORDS, &parsed_count, &flags)||
+                (flags & (DNS_FLAG_QR | DNS_OPCODE_MASK | DNS_FLAG_TC)) != DNS_FLAG_QR) {
                 msleep(50);
                 waited_ms += 50;
                 continue;
             }
             if ((flags & DNS_RCODE_MASK) == DNS_RCODE_NXDOMAIN) return DNS_ERR_NXDOMAIN;
+            if (flags & DNS_RCODE_MASK) return DNS_ERR_NO_ANSWER;
 
             uint32_t count = 0;
             for (uint32_t i = 0; i < parsed_count; i++) {
@@ -204,11 +204,11 @@ static dns_result_t dns_resolve_ip_common(uint8_t use_l3, l3_id_t l3_id, const c
 
                 uint32_t ttl_s = records[i].ttl_s;
                 uint32_t ttl_ms = ttl_s > (UINT32_MAX - 1) / 1000 ? UINT32_MAX - 1 : ttl_s * 1000;
-                dns_cache_put_ip(current, qtype, out_addr, ttl_ms);
+                dns_cache_put_ip(use_l3 ? l3_id : 0, current, qtype, out_addr, ttl_ms);
                 if (!dns_wire_name_equals(hostname, current)) {
                     if (ttl_s > alias_ttl_s) ttl_s = alias_ttl_s;
                     uint32_t alias_ms = ttl_s > (UINT32_MAX - 1) / 1000 ? UINT32_MAX - 1 : ttl_s * 1000;
-                    dns_cache_put_ip(hostname, qtype, out_addr, alias_ms);
+                    dns_cache_put_ip(use_l3 ? l3_id : 0, hostname, qtype, out_addr, alias_ms);
                 }
                 if (out_ttl_s) *out_ttl_s = ttl_s;
                 return DNS_OK;
@@ -247,17 +247,15 @@ static dns_result_t dns_resolve_ip_common(uint8_t use_l3, l3_id_t l3_id, const c
 dns_result_t dns_resolve_a(const char* hostname, uint32_t* out_ip, dns_server_sel_t which, uint32_t timeout_ms) {
     if (!hostname || !out_ip) return DNS_ERR_FORMAT;
     uint8_t cached[16];
-    if (dns_cache_get_ip(hostname, DNS_TYPE_A, cached)) {
+    if (dns_cache_get_ip(0, hostname, DNS_TYPE_A, cached)) {
         *out_ip = rd_be32(cached);
         return DNS_OK;
     }
 
     uint8_t addr[16];
     uint32_t ttl_s = 0;
-    uint32_t mdns_timeout = timeout_ms > MDNS_TIMEOUT_A_MS ? MDNS_TIMEOUT_A_MS : timeout_ms;
-    dns_result_t res;
-    if (dns_wire_is_local_name(hostname)) res = dns_resolve_ip_common(0,0, hostname, DNS_TYPE_A, addr, which, mdns_timeout, &ttl_s);
-    else res = dns_resolve_ip_common(0, 0, hostname, DNS_TYPE_A, addr, which, timeout_ms, &ttl_s);
+    if (dns_wire_is_local_name(hostname) && timeout_ms > MDNS_TIMEOUT_A_MS) timeout_ms = MDNS_TIMEOUT_A_MS;
+    dns_result_t res = dns_resolve_ip_common(0, 0, hostname, DNS_TYPE_A, addr, which, timeout_ms, &ttl_s);
     if (res != DNS_OK) return res;
 
     *out_ip = rd_be32(addr);
@@ -265,19 +263,17 @@ dns_result_t dns_resolve_a(const char* hostname, uint32_t* out_ip, dns_server_se
 }
 
 dns_result_t dns_resolve_a_on_l3(l3_id_t l3_id, const char* hostname, uint32_t* out_ip, dns_server_sel_t which, uint32_t timeout_ms) {
-    if (!hostname || !out_ip) return DNS_ERR_FORMAT;
+    if (!l3_id || !hostname || !out_ip) return DNS_ERR_FORMAT;
     uint8_t cached[16];
-    if (dns_cache_get_ip(hostname, DNS_TYPE_A, cached)) {
+    if (dns_cache_get_ip(l3_id, hostname, DNS_TYPE_A, cached)) {
         *out_ip = rd_be32(cached);
         return DNS_OK;
     }
 
     uint8_t addr[16];
     uint32_t ttl_s = 0;
-    uint32_t mdns_timeout = timeout_ms > MDNS_TIMEOUT_A_MS ? MDNS_TIMEOUT_A_MS : timeout_ms;
-    dns_result_t res;
-    if (dns_wire_is_local_name(hostname)) res = dns_resolve_ip_common(1, l3_id, hostname, DNS_TYPE_A, addr, which, mdns_timeout, &ttl_s);
-    else res = dns_resolve_ip_common(1, l3_id, hostname, DNS_TYPE_A, addr, which, timeout_ms, &ttl_s);
+    if (dns_wire_is_local_name(hostname) && timeout_ms > MDNS_TIMEOUT_A_MS) timeout_ms = MDNS_TIMEOUT_A_MS;
+    dns_result_t res = dns_resolve_ip_common(1, l3_id, hostname, DNS_TYPE_A, addr, which, timeout_ms, &ttl_s);
     if (res != DNS_OK) return res;
 
     *out_ip = rd_be32(addr);
@@ -286,19 +282,17 @@ dns_result_t dns_resolve_a_on_l3(l3_id_t l3_id, const char* hostname, uint32_t* 
 
 dns_result_t dns_resolve_aaaa(const char* hostname, uint8_t out_ipv6[16], dns_server_sel_t which, uint32_t timeout_ms) {
     if (!hostname || !out_ipv6) return DNS_ERR_FORMAT;
-    if (dns_cache_get_ip(hostname, DNS_TYPE_AAAA, out_ipv6)) return DNS_OK;
+    if (dns_cache_get_ip(0, hostname, DNS_TYPE_AAAA, out_ipv6)) return DNS_OK;
 
     uint32_t ttl_s = 0;
-    uint32_t mdns_timeout = timeout_ms > MDNS_TIMEOUT_AAAA_MS ? MDNS_TIMEOUT_AAAA_MS : timeout_ms;
-    if (dns_wire_is_local_name(hostname)) return dns_resolve_ip_common(0, 0, hostname, DNS_TYPE_AAAA, out_ipv6, which, mdns_timeout, &ttl_s);
+    if (dns_wire_is_local_name(hostname) && timeout_ms > MDNS_TIMEOUT_AAAA_MS) timeout_ms = MDNS_TIMEOUT_AAAA_MS;
     return dns_resolve_ip_common(0, 0, hostname, DNS_TYPE_AAAA, out_ipv6, which, timeout_ms, &ttl_s);
 }
 
 dns_result_t dns_resolve_aaaa_on_l3(l3_id_t l3_id, const char* hostname, uint8_t out_ipv6[16], dns_server_sel_t which, uint32_t timeout_ms) {
-    if (!hostname || !out_ipv6) return DNS_ERR_FORMAT;
-    if (dns_cache_get_ip(hostname, DNS_TYPE_AAAA, out_ipv6)) return DNS_OK;
+    if (!l3_id || !hostname || !out_ipv6) return DNS_ERR_FORMAT;
+    if (dns_cache_get_ip(l3_id, hostname, DNS_TYPE_AAAA, out_ipv6)) return DNS_OK;
     uint32_t ttl_s = 0;
-    uint32_t mdns_timeout = timeout_ms > MDNS_TIMEOUT_AAAA_MS ? MDNS_TIMEOUT_AAAA_MS : timeout_ms;
-    if (dns_wire_is_local_name(hostname)) return dns_resolve_ip_common(1, l3_id, hostname, DNS_TYPE_AAAA, out_ipv6, which, mdns_timeout, &ttl_s);
+    if (dns_wire_is_local_name(hostname) && timeout_ms > MDNS_TIMEOUT_AAAA_MS) timeout_ms = MDNS_TIMEOUT_AAAA_MS;
     return dns_resolve_ip_common(1, l3_id, hostname, DNS_TYPE_AAAA, out_ipv6, which, timeout_ms, &ttl_s);
 }

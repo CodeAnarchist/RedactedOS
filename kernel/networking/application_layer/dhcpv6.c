@@ -7,13 +7,10 @@
 
 static bool opt_append(uint8_t* b, uint32_t cap, uint32_t* off, uint16_t code, const void* data, uint16_t len){
     if (!b || !off) return false;
-    if (*off + 4u + len > cap) return false;
+    if (*off > cap || cap - *off < 4u + len) return false;
 
-    uint16_t c = bswap16(code);
-    uint16_t l = bswap16(len);
-
-    memcpy(b + *off + 0, &c, 2);
-    memcpy(b + *off + 2, &l, 2);
+    wr_be16(b + *off, code);
+    wr_be16(b + *off + 2, len);
 
     if (len && data) memcpy(b + *off + 4, data, len);
 
@@ -47,11 +44,8 @@ bool dhcpv6_build_message(uint8_t*out, uint32_t out_cap, uint32_t*out_len, const
     uint32_t off = 4;
 
     uint8_t duid[10];
-    uint16_t duid_type = bswap16(3);
-    uint16_t hw_type = bswap16(1);
-
-    memcpy(duid + 0, &duid_type, 2);
-    memcpy(duid + 2, &hw_type, 2);
+    wr_be16(duid, 3);
+    wr_be16(duid + 2, 1);
 
     if (mac) mac_copy(duid + 4, mac);
     else mac_clear(duid + 4);
@@ -88,51 +82,41 @@ bool dhcpv6_build_message(uint8_t*out, uint32_t out_cap, uint32_t*out_len, const
 
         uint8_t payload[40];
 
-        uint32_t iaid_net = bswap32(iaid);
-        uint32_t t1_net = 0;
-        uint32_t t2_net = 0;
-
-        memcpy(payload, &iaid_net, 4);
-        memcpy(payload + 4, &t1_net, 4);
-        memcpy(payload + 8, &t2_net, 4);
+        wr_be32(payload, iaid);
+        wr_be32(payload + 4, 0);
+        wr_be32(payload + 8, 0);
         uint16_t ia_len = 12;
 
         if (ia_addr && !ipv6_is_unspecified(ia_addr)) {
-            uint16_t code_net = bswap16(DHCPV6_OPT_IAADDR);
-            uint16_t len_net = bswap16(24);
-
-            memcpy(payload + 12, &code_net, 2);
-            memcpy(payload + 14, &len_net, 2);
+            wr_be16(payload + 12, DHCPV6_OPT_IAADDR);
+            wr_be16(payload + 14, 24);
             ipv6_cpy(payload + 16, ia_addr);
-            memcpy(payload + 32, &t1_net, 4);
-            memcpy(payload + 36, &t2_net, 4);
+            wr_be32(payload + 32, 0);
+            wr_be32(payload + 36, 0);
             ia_len = 40;
         } else if (msg_type == DHCPV6_MSG_CONFIRM || msg_type == DHCPV6_MSG_RENEW || msg_type == DHCPV6_MSG_REBIND || msg_type == DHCPV6_MSG_RELEASE || msg_type == DHCPV6_MSG_DECLINE) return false;
 
         if (!opt_append(out, out_cap, &off, DHCPV6_OPT_IA_NA, payload, ia_len)) return false;
 
         if (rt->pd_prefix_len) {
-            uint32_t pd_iaid_net = bswap32(iaid ^ 0xA5A5A5A5u);
+            uint32_t pd_iaid = iaid ^ 0xA5A5A5A5u;
             if (msg_type == DHCPV6_MSG_SOLICIT) {
                 uint8_t iapd[12];
-                memcpy(iapd, &pd_iaid_net, 4);
-                memcpy(iapd + 4, &t1_net, 4);
-                memcpy(iapd + 8, &t2_net, 4);
+                wr_be32(iapd, pd_iaid);
+                wr_be32(iapd + 4, 0);
+                wr_be32(iapd + 8, 0);
                 if (!opt_append(out, out_cap, &off, DHCPV6_OPT_IA_PD, iapd, 12)) return false;
             } else {
                 uint8_t iapd[41];
-                uint16_t code_net = bswap16(DHCPV6_OPT_IAPREFIX);
-                uint16_t len_net = bswap16(25);
-                uint32_t preferred_net = bswap32(rt->pd_preferred_lft);
-                uint32_t valid_net = bswap32(rt->pd_valid_lft);
-
-                memcpy(iapd, &pd_iaid_net, 4);
-                memcpy(iapd + 4, &t1_net, 4);
-                memcpy(iapd + 8, &t2_net, 4);
-                memcpy(iapd + 12, &code_net, 2);
-                memcpy(iapd + 14, &len_net, 2);
-                memcpy(iapd + 16, &preferred_net, 4);
-                memcpy(iapd + 20, &valid_net, 4);
+                wr_be32(iapd, pd_iaid);
+                wr_be32(iapd + 4, 0);
+                wr_be32(iapd + 8, 0);
+                wr_be16(iapd + 12, DHCPV6_OPT_IAPREFIX);
+                wr_be16(iapd + 14, 25);
+                uint32_t preferred = rt->pd_preferred_lft;
+                uint32_t valid = rt->pd_valid_lft;
+                wr_be32(iapd + 16, preferred);
+                wr_be32(iapd + 20, valid);
 
                 iapd[24] = rt->pd_prefix_len;
                 ipv6_cpy(iapd + 25, rt->pd_prefix);
@@ -150,14 +134,8 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
 
     while (off < opt_len) {
         if (off + 4 > opt_len) return false;
-        uint16_t code_net;
-        uint16_t len_net;
-
-        memcpy(&code_net, opt + off + 0, 2);
-        memcpy(&len_net, opt + off + 2, 2);
-
-        uint16_t code = bswap16(code_net);
-        uint16_t len = bswap16(len_net);
+        uint16_t code = rd_be16(opt + off);
+        uint16_t len = rd_be16(opt + off + 2);
 
         off += 4;
         if (off + len >opt_len) return false;
@@ -175,9 +153,7 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
             out->has_client_id = true;
         } else if (code == DHCPV6_OPT_STATUS_CODE) {
             if (out->has_status || len < 2) return false;
-            uint16_t status_net;
-            memcpy(&status_net, data, 2);
-            out->status_code = bswap16(status_net);
+            out->status_code = rd_be16(data);
             out->has_status = true;
         } else if (code == DHCPV6_OPT_DNS_SERVERS) {
             if (len < 16 || (len % 16) != 0) return false;
@@ -192,12 +168,8 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
             uint8_t count = 0;
             while (ntp_off < len) {
                 if (ntp_off + 4 > len) return false;
-                uint16_t sc_net;
-                uint16_t sl_net;
-                memcpy(&sc_net, data + ntp_off, 2);
-                memcpy(&sl_net, data + ntp_off + 2, 2);
-                uint16_t sc = bswap16(sc_net);
-                uint16_t sl = bswap16(sl_net);
+                uint16_t sc = rd_be16(data + ntp_off);
+                uint16_t sl = rd_be16(data + ntp_off + 2);
                 ntp_off += 4;
                 if (ntp_off + sl > len) return false;
                 if (sc == DHCPV6_NTP_SUBOPT_SERVER_ADDR && sl == 16 && count < 2) {
@@ -209,9 +181,7 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
             out->has_ntp = count != 0;
         } else if (code == DHCPV6_OPT_SOL_MAX_RT || code == DHCPV6_OPT_INF_MAX_RT || code == DHCPV6_OPT_INFORMATION_REFRESH_TIME) {
             if (len != 4) return false;
-            uint32_t value_net;
-            memcpy(&value_net, data, 4);
-            uint32_t value = bswap32(value_net);
+            uint32_t value = rd_be32(data);
             if (code == DHCPV6_OPT_INFORMATION_REFRESH_TIME) {
                 out->has_info_refresh_time = true;
                 out->info_refresh_time = value;
@@ -226,18 +196,10 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
             }
         } else if (code == DHCPV6_OPT_IA_NA) {
             if (len < 12) return false;
-            uint32_t iaid_net;
-            uint32_t t1_net;
-            uint32_t t2_net;
-
-            memcpy(&iaid_net, data, 4);
-            memcpy(&t1_net, data + 4, 4);
-            memcpy(&t2_net, data + 8, 4);
-
-            uint32_t iaid = bswap32(iaid_net);
+            uint32_t iaid = rd_be32(data);
             if (!expect_iaid || iaid == expect_iaid) {
-                uint32_t t1 = bswap32(t1_net);
-                uint32_t t2 = bswap32(t2_net);
+                uint32_t t1 = rd_be32(data + 4);
+                uint32_t t2 = rd_be32(data + 8);
                 if (t1 && t2 && t1 > t2) {
                     off += len;
                     continue;
@@ -249,33 +211,19 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
                 uint32_t sub = 12;
                 while (sub < len) {
                     if (sub + 4 > len) return false;
-                    uint16_t sc_net;
-                    uint16_t sl_net;
-
-                    memcpy(&sc_net, data + sub, 2);
-                    memcpy(&sl_net, data + sub + 2, 2);
-
-                    uint16_t sc = bswap16(sc_net);
-                    uint16_t sl = bswap16(sl_net);
+                    uint16_t sc = rd_be16(data + sub);
+                    uint16_t sl = rd_be16(data + sub + 2);
 
                     sub += 4;
                     if (sub + sl > len) return false;
 
                     if (sc == DHCPV6_OPT_STATUS_CODE) {
                         if (out->has_ia_status || sl < 2) return false;
-                        uint16_t status_net;
-                        memcpy(&status_net, data + sub, 2);
-                        out->ia_status_code = bswap16(status_net);
+                        out->ia_status_code = rd_be16(data + sub);
                         out->has_ia_status = true;
                     } else if (sc == DHCPV6_OPT_IAADDR && sl >= 24 && !out->has_addr) {
-                        uint32_t pref_net;
-                        uint32_t valid_net;
-
-                        memcpy(&pref_net, data + sub + 16, 4);
-                        memcpy(&valid_net, data + sub + 20, 4);
-
-                        uint32_t preferred = bswap32(pref_net);
-                        uint32_t valid = bswap32(valid_net);
+                        uint32_t preferred = rd_be32(data + sub + 16);
+                        uint32_t valid = rd_be32(data + sub + 20);
                         if (preferred <= valid && !ipv6_is_unspecified(data + sub)) {
                             if (valid) {
                                 ipv6_cpy(out->addr, data + sub);
@@ -293,36 +241,22 @@ static bool parse_opts(const uint8_t*opt, uint32_t opt_len, uint32_t expect_iaid
             }
         } else if (code == DHCPV6_OPT_IA_PD){
             if (len < 12) return false;
-            uint32_t iaid_net;
-            memcpy(&iaid_net, data, 4);
-            uint32_t iaid = bswap32(iaid_net);
+            uint32_t iaid = rd_be32(data);
             uint32_t expect_pd_iaid = expect_iaid ? (expect_iaid ^ 0xA5A5A5A5u) : 0;
 
             if (!expect_pd_iaid || iaid == expect_pd_iaid) {
                 uint32_t sub = 12;
                 while (sub < len) {
                     if (sub + 4 > len) return false;
-                    uint16_t sc_net;
-                    uint16_t sl_net;
-
-                    memcpy(&sc_net, data + sub, 2);
-                    memcpy(&sl_net, data + sub + 2, 2);
-
-                    uint16_t sc = bswap16(sc_net);
-                    uint16_t sl = bswap16(sl_net);
+                    uint16_t sc = rd_be16(data + sub);
+                    uint16_t sl = rd_be16(data + sub + 2);
 
                     sub += 4;
                     if (sub + sl > len) return false;
 
                     if (sc == DHCPV6_OPT_IAPREFIX && sl >= 25 && !out->has_pd) {
-                        uint32_t pref_net;
-                        uint32_t valid_net;
-
-                        memcpy(&pref_net, data + sub, 4);
-                        memcpy(&valid_net, data + sub + 4, 4);
-
-                        uint32_t preferred = bswap32(pref_net);
-                        uint32_t valid = bswap32(valid_net);
+                        uint32_t preferred = rd_be32(data + sub);
+                        uint32_t valid = rd_be32(data + sub + 4);
                         uint8_t prefix_len = data[sub + 8];
 
                         if (preferred <= valid && prefix_len <= 128 && valid) {

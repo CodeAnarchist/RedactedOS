@@ -1,6 +1,5 @@
 #include "ssdp_daemon.h"
 
-#include "process/scheduler.h"
 #include "std/memory.h"
 #include "std/string.h"
 #include "syscalls/syscalls.h"
@@ -12,7 +11,6 @@
 #include "networking/internet_layer/ipv4_utils.h"
 #include "networking/internet_layer/ipv6_utils.h"
 #include "networking/interface_manager.h"
-#include "math/math.h"
 #include "random/random.h"
 
 //at the moment it's a very basic version. it's a protocol still in use but only in few cases
@@ -29,7 +27,6 @@ typedef struct {
 typedef struct {
     socket_handle_t sock;
     ip_version_t ver;
-    uint8_t mcast_ip[16];
 } ssdp_socket_entry_t;
 
 static rng_t ssdp_rng;
@@ -64,17 +61,22 @@ static void ssdp_schedule_response(socket_handle_t sock, const net_l4_endpoint* 
 }
 
 static void ssdp_send_notify(bool alive) {
+    string msg[2] = {{0}};
+    net_l4_endpoint dst[2];
+    make_ep(&ssdp_host_v4, 1900, IP_VER4, &dst[0]);
+    make_ep(ssdp_host_v6, 1900, IP_VER6, &dst[1]);
+
     for (uint16_t i = 0; i < ssdp_socket_count; i++) {
         socket_handle_t s = ssdp_sockets[i].sock;
         if (!s) continue;
 
-        string msg = ssdp_build_notify(alive, ssdp_sockets[i].ver == IP_VER6);
-        net_l4_endpoint dst;
-        if (ssdp_sockets[i].ver == IP_VER4) make_ep(&ssdp_host_v4, 1900, IP_VER4, &dst);
-        else make_ep(ssdp_host_v6, 1900, IP_VER6, &dst);
-        (void)send_to_socket(s, &dst, (void*)msg.data, msg.length);
-        string_free(msg);
+        bool v6 = ssdp_sockets[i].ver == IP_VER6;
+        if (!msg[v6].data) msg[v6] = ssdp_build_notify(alive, v6);
+        if (!msg[v6].data || !msg[v6].length) continue;
+        (void)send_to_socket(s, &dst[v6], msg[v6].data, msg[v6].length);
     }
+    string_free(msg[0]);
+    string_free(msg[1]);
 }
 
 int ssdp_daemon_entry(int argc, char* argv[]) {
@@ -115,7 +117,6 @@ int ssdp_daemon_entry(int argc, char* argv[]) {
 
             ssdp_sockets[ssdp_socket_count].sock = s;
             ssdp_sockets[ssdp_socket_count].ver = IP_VER4;
-            memcpy(ssdp_sockets[ssdp_socket_count].mcast_ip, &ssdp_host_v4, 4);
             ssdp_socket_count++;
         }
 
@@ -145,7 +146,6 @@ int ssdp_daemon_entry(int argc, char* argv[]) {
 
             ssdp_sockets[ssdp_socket_count].sock = s;
             ssdp_sockets[ssdp_socket_count].ver = IP_VER6;
-            ipv6_cpy(ssdp_sockets[ssdp_socket_count].mcast_ip, ssdp_host_v6);
             ssdp_socket_count++;
         }
     }

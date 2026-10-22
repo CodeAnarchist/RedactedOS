@@ -1,7 +1,6 @@
 #include "csocket_http_internal.h"
 #include "http.h"
 #include "net/socket_types.h"
-#include "process/scheduler.h"
 #include "syscalls/syscalls.h"
 
 int32_t http_socket_close(socket_handle_t *socket, bool abort) {
@@ -64,12 +63,16 @@ int32_t http_socket_recv_head(socket_handle_t socket,
         if (result < 0) return (int32_t)result;
         if (result == 0) return SOCK_ERR_PROTO;
 
+        uint32_t scan = buffer->length > 3 ? buffer->length - 3 : 0;
         uint32_t expected = buffer->length + (uint32_t)result;
         string_append_bytes(buffer, temporary, (uint32_t)result);
         if (buffer->length != expected) return SOCK_ERR_SYS;
 
-        *header_end = find_crlfcrlf(buffer->data, buffer->length);
-        if (*header_end >= 0) return (uint32_t)*header_end + 4 <= max_header_bytes ? SOCK_OK : SOCK_ERR_PROTO;
+        *header_end = find_crlfcrlf(buffer->data + scan, buffer->length - scan);
+        if (*header_end >= 0) {
+            *header_end += scan;
+            return (uint32_t)*header_end + 4 <= max_header_bytes ? SOCK_OK : SOCK_ERR_PROTO;
+        }
         if (buffer->length >= max_header_bytes) return SOCK_ERR_PROTO;
     }
 

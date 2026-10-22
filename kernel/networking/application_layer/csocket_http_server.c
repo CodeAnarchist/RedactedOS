@@ -1,10 +1,10 @@
 #include "csocket_http_server.h"
 #include "csocket_http_internal.h"
-#include "console/kio.h"
 #include "networking/transport_layer/csocket.h"
 #include "networking/net_logger/net_logger.h"
 #include "http.h"
-#include "std/std.h"
+#include "std/string.h"
+#include "std/memory.h"
 #include "net/socket_types.h"
 #include "syscalls/syscalls.h"
 #include "process/scheduler.h"
@@ -137,12 +137,8 @@ HTTPRequestMsg http_server_recv_request(http_server_handle_t h, http_connection_
     HTTPConnection* conn = (HTTPConnection*)c;
     if (!conn->client) return req;
 
-    string buf = (string){0};
-    if (conn->carry_buf.length) {
-        string_append_bytes(&buf, conn->carry_buf.data, conn->carry_buf.length);
-        string_free(conn->carry_buf);
-        conn->carry_buf = (string){0};
-    }
+    string buf = conn->carry_buf;
+    conn->carry_buf = (string){0};
 
     char tmp[2048];
     int32_t hdr_end = -1;
@@ -159,6 +155,7 @@ HTTPRequestMsg http_server_recv_request(http_server_handle_t h, http_connection_
             reject_status = HTTP_HEADER_FIELDS_TOO_LARGE;
         } else {
             string_free(buf);
+            if (conn->client) http_socket_close(&conn->client, true);
             return req;
         }
     }
@@ -202,29 +199,40 @@ HTTPRequestMsg http_server_recv_request(http_server_handle_t h, http_connection_
             req.method = line.method;
             req.version = line.version;
             req.path = (string){0};
+            uint32_t expepted_len = target_len;
 
-            if (target_len >= 7 && memcmp(target, "http://", 7) == 0) {
+            uint32_t scheme_len = 0;
+            if (target_len >= 7 && memcmp(target, "http://", 7) == 0) scheme_len = 7;
+            else if (target_len >= 8 && memcmp(target, "https://", 8) == 0) scheme_len = 8;
+
+            if (scheme_len) {
                 if (!srv->policy.allow_absolute_uri) {
                     bad_request = true;
                     reject_status = HTTP_BAD_REQUEST;
                 } else {
-                    uint32_t k = 7;
-                    while (k < target_len && target[k] != '/') k++;
-                    if (k < target_len) string_append_bytes(&req.path, target + k, target_len - k);
-                    else string_append_bytes(&req.path, "/", 1);
-                }
-            } else if (target_len >= 8 && memcmp(target, "https://", 8) == 0) {
-                if (!srv->policy.allow_absolute_uri) {
-                    bad_request = true;
-                    reject_status = HTTP_BAD_REQUEST;
-                } else {
-                    uint32_t k = 8;
-                    while (k < target_len && target[k] != '/') k++;
-                    if (k < target_len) string_append_bytes(&req.path, target + k, target_len - k);
-                    else string_append_bytes(&req.path, "/", 1);
+                    const char* authority = target + scheme_len;
+                    uint32_t remaining = target_len - scheme_len;
+                    const char* slash = memchr(authority, '/', remaining);
+                    const char* query = memchr(authority, '?', remaining);
+                    if (query && (!slash || query < slash)) {
+                        uint32_t query_len = target_len - (uint32_t)(query - target);
+                        expepted_len = query_len + 1;
+                        string_append_bytes(&req.path, "/", 1);
+                        if (req.path.length == 1) string_append_bytes(&req.path, query, query_len);
+                    } else if (slash) { 
+                        expepted_len = target_len - (uint32_t)(slash - target);
+                        string_append_bytes(&req.path, slash, expepted_len);
+                    } else {
+                        expepted_len = 1;
+                        string_append_bytes(&req.path, "/", 1);
+                    }
                 }
             } else string_append_bytes(&req.path, target, target_len);
 
+            if (!bad_request && req.path.length != expepted_len) {
+                bad_request = true;
+                reject_status = HTTP_INTERNAL_SERVER_ERROR;
+            }
             if (!bad_request && (!req.path.length || req.path.length > srv->policy.common.max_path_len)) {
                 bad_request = true;
                 reject_status = req.path.length > srv->policy.common.max_path_len ? HTTP_URI_TOO_LONG : HTTP_BAD_REQUEST;
@@ -296,7 +304,9 @@ HTTPRequestMsg http_server_recv_request(http_server_handle_t h, http_connection_
                 consumed = buf.length;
                 if (chunk_result == HTTP_PARSE_OK && used < (uint32_t)r && !conn->carry_buf.length) {
                     conn->carry_buf = (string){0};
-                    string_append_bytes(&conn->carry_buf, tmp + used, (uint32_t)r - used);
+                    uint32_t extra = (uint32_t)r - used;
+                    string_append_bytes(&conn->carry_buf, tmp + used, extra);
+                    if (conn->carry_buf.length != extra) conn->close_after_response = true;
                 }
             }
 
@@ -397,7 +407,9 @@ HTTPRequestMsg http_server_recv_request(http_server_handle_t h, http_connection_
 
     if (consumed < buf.length && !conn->carry_buf.length) {
         conn->carry_buf = (string){0};
-        string_append_bytes(&conn->carry_buf, buf.data + consumed, buf.length - consumed);
+        uint32_t extra = buf.length - consumed;
+        string_append_bytes(&conn->carry_buf, buf.data + consumed, extra);
+        if (conn->carry_buf.length != extra) conn->close_after_response = true;
     }
 
     string_free(buf);
@@ -444,6 +456,7 @@ int32_t http_server_send_response(http_server_handle_t h, http_connection_handle
         }
     }
     string out = http_response_builder(&head);
+    if (!out.data || !out.length) return SOCK_ERR_SYS;
     uint32_t out_len = out.length + body_len;
     int64_t sent = 0;
     uint32_t start_ms = (uint32_t)get_time();
@@ -495,6 +508,7 @@ int32_t http_server_send_response(http_server_handle_t h, http_connection_handle
     netlog_socket_event(&srv->log_opts, &ev);
 
     string_free(out);
+    if (sent < 0 && conn->client) http_socket_close(&conn->client, true);
     if (sent >= 0 && close_after_send && conn->client) {
         int32_t close_result = http_socket_close(&conn->client, false);
         if (close_result < 0) return close_result;

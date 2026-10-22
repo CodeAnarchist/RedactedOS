@@ -1,10 +1,7 @@
 #include "dhcp.h"
 #include "std/memory.h"
-#include "networking/transport_layer/udp.h"
-#include "networking/internet_layer/ipv4.h"
 #include "networking/link_layer/link_utils.h"
 #include "types.h"
-#include "syscalls/syscalls.h"
 
 static size_t dhcp_options_write_param_req_list(uint8_t *opt, size_t idx) {
     static const uint8_t prl[] = { 1, 3, 6, 15, 42, 26, 51, 58, 59, 119 };

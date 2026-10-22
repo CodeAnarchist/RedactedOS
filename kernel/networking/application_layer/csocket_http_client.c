@@ -1,10 +1,10 @@
 #include "csocket_http_client.h"
 #include "csocket_http_internal.h"
-#include "console/kio.h"
 #include "networking/transport_layer/csocket.h"
 #include "networking/net_logger/net_logger.h"
 #include "http.h"
-#include "std/std.h"
+#include "std/string.h"
+#include "std/memory.h"
 #include "net/socket_types.h"
 #include "data/format/url.h"
 #include "networking/transport_layer/trans_utils.h"
@@ -42,18 +42,21 @@ static HTTPResponseMsg http_client_receive_response(HTTPClient* cli, HTTPMethod 
         int32_t head_result = http_socket_recv_head(cli->sock, &buf, cli->policy.common.max_header_bytes, cli->policy.common.header_idle_timeout_ms, cli->policy.common.header_total_timeout_ms, &hdr_end);
         if (head_result < 0) {
             string_free(buf);
+            if (cli->sock) http_socket_close(&cli->sock, true);
             return http_client_error_response(head_result == SOCK_ERR_WOULDBLOCK ? SOCK_ERR_PROTO : head_result);
         }
 
         int32_t status_line_end = strindex((char*)buf.data, "\r\n");
         if (status_line_end <= 0) {
             string_free(buf);
+            if (cli->sock) http_socket_close(&cli->sock, true);
             return http_client_error_response(SOCK_ERR_PROTO);
         }
 
         HTTPStatusLine status_line = {0};
         if (http_parse_status_line(buf.data, status_line_end, &status_line) != HTTP_PARSE_OK) {
             string_free(buf);
+            if (cli->sock) http_socket_close(&cli->sock, true);
             return http_client_error_response(SOCK_ERR_PROTO);
         }
 
@@ -89,10 +92,9 @@ static HTTPResponseMsg http_client_receive_response(HTTPClient* cli, HTTPMethod 
             http_headers_common_free(&info.headers_common);
             http_headers_extra_free(info.extra_headers, info.extra_header_count);
 
-            string next = (string){0};
-            if (have) string_append_bytes(&next, buf.data + body_start, have);
-            string_free(buf);
-            buf = next;
+            if (have) memmove(buf.data, buf.data + body_start, have);
+            if (buf.data) buf.data[have] = 0;
+            buf.length = have;
             continue;
         }
 
@@ -163,30 +165,40 @@ static HTTPResponseMsg http_client_receive_response(HTTPClient* cli, HTTPMethod 
                 }
             } else if (cli->policy.allow_close_delimited) {
                 string body = (string){0};
-                if (have) string_append_bytes(&body, buf.data + body_start, have);
+                uint32_t max_body = cli->policy.common.max_body_bytes;
+                bool bad_body = have > max_body;
+                int64_t body_err = SOCK_ERR_PROTO;
+                if (!bad_body && have) {
+                    string_append_bytes(&body, buf.data + body_start, have);
+                    bad_body = body.length != have;
+                }
 
                 uint32_t body_start_ms = (uint32_t)get_time();
                 HTTPSocketTimeoutState body_timeout = {body_start_ms, body_start_ms};
-                while (body.length <= cli->policy.common.max_body_bytes) {
+                while (!bad_body) {
                     int64_t r = http_socket_recv_wait(cli->sock, tmp, sizeof(tmp), cli->policy.common.body_idle_timeout_ms, cli->policy.common.body_total_timeout_ms, &body_timeout);
                     if (r < 0) {
-                        string_free(body);
-                        http_response_free(&resp);
-                        string_free(buf);
-                        if (cli->sock) (void)http_socket_close(&cli->sock, true);
-                        return http_client_error_response(r == SOCK_ERR_WOULDBLOCK ? SOCK_ERR_PROTO : r);
+                        body_err = r == SOCK_ERR_WOULDBLOCK ? SOCK_ERR_PROTO : r;
+                        bad_body = true;
+                        break;
                     }
                     if (r == 0) break;
-                    if (body.length + (uint32_t)r > cli->policy.common.max_body_bytes) {
-                        string_free(body);
-                        http_response_free(&resp);
-                        string_free(buf);
-                        if (cli->sock) (void)http_socket_close(&cli->sock, true);
-                        return http_client_error_response(SOCK_ERR_PROTO);
+                    if ((uint32_t)r > max_body - body.length) {
+                        bad_body = true;
+                        break;
                     }
+                    uint32_t expected = body.length + (uint32_t)r;
                     string_append_bytes(&body, tmp, (uint32_t)r);
+                    if (body.length != expected) bad_body = true;
                 }
 
+                if (bad_body) {
+                    string_free(body);
+                    http_response_free(&resp);
+                    string_free(buf);
+                    if (cli->sock) http_socket_close(&cli->sock, true);
+                    return http_client_error_response(body_err);
+                }
                 if (body.length) {
                     resp.body = body;
                 } else if (body.mem_length) string_free(body);
@@ -299,10 +311,8 @@ HTTPResponseMsg http_client_send_request(http_client_handle_t h, const HTTPReque
 
     HTTPClient* cli = (HTTPClient*)h;
     HTTPRequestMsg curr = *req;
-    curr.path = (string){0};
-    if (req->path.data && req->path.length) string_append_bytes(&curr.path, req->path.data, req->path.length);
-    curr.headers_common.fields.host = (string){0};
-    if (req->headers_common.fields.host.data && req->headers_common.fields.host.length) string_append_bytes(&curr.headers_common.fields.host, req->headers_common.fields.host.data, req->headers_common.fields.host.length);
+    curr.path.mem_length = 0;
+    curr.headers_common.fields.host.mem_length = 0;
 
     HTTPResponseMsg resp = {0};
     uint32_t redirects = cli->policy.follow_redirects ? cli->policy.max_redirects : 0;
@@ -315,7 +325,7 @@ HTTPResponseMsg http_client_send_request(http_client_handle_t h, const HTTPReque
         if (!curr.host_override && curr.version != HTTP_VERSION_10 && !curr.headers_common.fields.host.length && cli->origin.valid) {
             if (cli->origin.domain.data) {
                 uint16_t host_port = cli->origin.ep.port;
-                bool ipv6 = str_has_char(cli->origin.domain.data, cli->origin.domain.length, ':') >= 0;
+                bool ipv6 = memchr(cli->origin.domain.data, ':', cli->origin.domain.length) != 0;
                 if (host_port && host_port != 80) {
                     if (ipv6) curr.headers_common.fields.host = string_format("[%.*s]:%i", (int)cli->origin.domain.length, cli->origin.domain.data, (int)host_port);
                     else curr.headers_common.fields.host = string_format("%.*s:%i", (int)cli->origin.domain.length, cli->origin.domain.data, (int)host_port);
@@ -340,6 +350,11 @@ HTTPResponseMsg http_client_send_request(http_client_handle_t h, const HTTPReque
         }
 
         string out = http_request_builder(&curr);
+        if (!out.data || !out.length) {
+            if (out.mem_length) string_free(out);
+            resp = http_client_error_response(SOCK_ERR_SYS);
+            break;
+        }
         uint32_t out_len = out.length;
 
         uint32_t send_start_ms = (uint32_t)get_time();
@@ -367,6 +382,7 @@ HTTPResponseMsg http_client_send_request(http_client_handle_t h, const HTTPReque
         string_free(out);
 
         if (sent < 0) {
+            if (cli->sock) http_socket_close(&cli->sock, true);
             resp = http_client_error_response(sent);
             break;
         }

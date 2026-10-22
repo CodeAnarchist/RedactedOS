@@ -2,7 +2,7 @@
 #include "networking/internet_layer/ipv4_utils.h"
 #include "networking/internet_layer/ipv6_utils.h"
 #include "networking/interface_manager.h"
-#include "std/std.h"
+#include "std/memory.h"
 #include "networking/transport_layer/trans_utils.h"
 
 #define MDNS_QUERY_TARGETS_MAX (MAX_L2_INTERFACES * 2)

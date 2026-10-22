@@ -10,7 +10,8 @@
 #include "data/hash.h"
 #include "math/rng.h"
 #include "random/random.h"
-#include "std/std.h"
+#include "std/string.h"
+#include "std/memory.h"
 #include "syscalls/syscalls.h"
 
 #define MDNS_ANNOUNCE_BURST 2
@@ -46,14 +47,13 @@ bool mdns_send(socket_handle_t sock, const net_l4_endpoint *src, bool unicast, i
     if (unicast && src) {
         dst = *src;
         if (!dst.port) dst.port = DNS_MDNS_PORT;
-        return send_to_socket(sock, &dst, pkt, pkt_len) >= 0;
+    } else {
+        dst.ver = ver;
+        if (ver == IP_VER4) memcpy(dst.ip, mcast_ip, 4);
+        else ipv6_cpy(dst.ip, mcast_ip);
+        dst.port = DNS_MDNS_PORT;
     }
-
-    dst.ver = ver;
-    if (ver == IP_VER4) memcpy(dst.ip, mcast_ip, 4);
-    else ipv6_cpy(dst.ip, mcast_ip);
-    dst.port = DNS_MDNS_PORT;
-    return send_to_socket(sock, &dst, pkt, pkt_len) >= 0;
+    return send_to_socket(sock, &dst, pkt, pkt_len) == pkt_len;
 }
 
 static uint32_t mdns_probe_jitter(void) {
@@ -127,13 +127,15 @@ void mdns_cache_host(l2_interface_t* l2) {
         if (!ipv4_l3_is_ready(v4) || v4->is_localhost) continue;
         uint8_t ip[16] = {0};
         memcpy(ip, &v4->ip, 4);
-        dns_cache_put_ip(g_mdns_fqdn, DNS_TYPE_A, ip, ttl_ms);
+        dns_cache_put_ip(v4->l3_id, g_mdns_fqdn, DNS_TYPE_A, ip, ttl_ms);
+        dns_cache_put_ip(0, g_mdns_fqdn, DNS_TYPE_A, ip, ttl_ms);
     }
 
     for (uint8_t i = 0; i < MAX_IPV6_PER_INTERFACE; i++) {
         l3_ipv6_interface_t* v6 = l2->l3_v6[i];
         if (!ipv6_l3_is_ready(v6) || v6->is_localhost) continue;
-        dns_cache_put_ip(g_mdns_fqdn, DNS_TYPE_AAAA, v6->ip, ttl_ms);
+        dns_cache_put_ip(v6->l3_id, g_mdns_fqdn, DNS_TYPE_AAAA, v6->ip, ttl_ms);
+        dns_cache_put_ip(0, g_mdns_fqdn, DNS_TYPE_AAAA, v6->ip, ttl_ms);
     }
 }
 
@@ -229,10 +231,8 @@ static bool mdns_recent(const dns_record_t* r, ip_version_t ver, uint32_t l2_slo
     off = dns_wire_put_u32(key_data, sizeof(key_data), off, r->ttl_s);
     if (!off) return false;
 
-    uint8_t rdata[DNS_WIRE_MAX_NAME + 8];
-    uint32_t rdata_len = dns_wire_write_record_rdata(r, rdata, sizeof(rdata));
-    if (off + rdata_len > sizeof(key_data)) return false;
-    memcpy(key_data + off, rdata, rdata_len);
+    uint32_t rdata_len = dns_wire_write_record_rdata(r, key_data + off, sizeof(key_data) - off);
+    if (!rdata_len) return false;
     uint64_t key = hash_map_fnv1a64(key_data, off + rdata_len);
 
     int empty = -1;

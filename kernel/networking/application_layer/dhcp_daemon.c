@@ -1,19 +1,15 @@
 #include "dhcp_daemon.h"
 
-#include "console/kio.h"
 #include "std/memory.h"
-#include "process/scheduler.h"
 #include "kernel_processes/kprocess_loader.h"
 #include "exceptions/irq.h"
 #include "random/random.h"
 
 #include "networking/application_layer/dhcp.h"
-#include "networking/internet_layer/ipv4.h"
 #include "networking/internet_layer/ipv4_utils.h"
 #include "net/network_types.h"
 #include "networking/link_layer/arp.h"
 #include "networking/link_layer/link_utils.h"
-#include "networking/transport_layer/udp.h"
 
 #include "networking/transport_layer/csocket.h"
 #include "networking/transport_layer/trans_utils.h"
@@ -288,27 +284,21 @@ static dhcp_apply_result_t apply_offer_to_l3(l3_id_t l3_id, dhcp_packet *p, uint
     uint32_t mask_host = 0;
 
     idx = dhcp_parse_option_bounded(p, payload_len, 1);
-    if (idx != UINT16_MAX && (len = p->options[idx+1]) >= 4) {
-        uint32_t mask_net;
-        memcpy(&mask_net, &p->options[idx+2], 4);
-        mask_host = bswap32(mask_net);
+    if (idx != UINT16_MAX && p->options[idx+1] >= 4) {
+        mask_host = rd_be32(&p->options[idx+2]);
     }
 
     uint32_t gw_host = 0;
     idx = dhcp_parse_option_bounded(p, payload_len, 3);
-    if (idx != UINT16_MAX && (len = p->options[idx+1]) >= 4) {
-        uint32_t gw_net;
-        memcpy(&gw_net, &p->options[idx+2], 4);
-        gw_host = bswap32(gw_net);
+    if (idx != UINT16_MAX && p->options[idx+1] >= 4) {
+        gw_host = rd_be32(&p->options[idx+2]);
     }
 
     idx = dhcp_parse_option_bounded(p, payload_len, 6);
     if (idx != UINT16_MAX) {
         len = p->options[idx+1];
         for (int i = 0; i < 2 && (i*4 + 4) <= len; i++) {
-            uint32_t dns_net;
-            memcpy(&dns_net, &p->options[idx+2 + i*4], 4);
-            rt_local.dns[i] = bswap32(dns_net);
+            rt_local.dns[i] = rd_be32(&p->options[idx+2 + i*4]);
         }
     }
 
@@ -316,44 +306,34 @@ static dhcp_apply_result_t apply_offer_to_l3(l3_id_t l3_id, dhcp_packet *p, uint
     if (idx != UINT16_MAX) {
         len = p->options[idx+1];
         for (int i = 0; i < 2 && (i*4 + 4) <= len; i++) {
-            uint32_t ntp_net;
-            memcpy(&ntp_net, &p->options[idx+2 + i*4], 4);
-            rt_local.ntp[i] = bswap32(ntp_net);
+            rt_local.ntp[i] = rd_be32(&p->options[idx+2 + i*4]);
         }
     }
 
     idx = dhcp_parse_option_bounded(p, payload_len, 26);
     if (idx != UINT16_MAX && p->options[idx+1] == 2) {
-        uint16_t mtu_net;
-        memcpy(&mtu_net, &p->options[idx+2], 2);
-        uint16_t mtu = bswap16(mtu_net);
+        uint16_t mtu = rd_be16(&p->options[idx+2]);
         if (mtu >= 68) rt_local.mtu = mtu;
     }
 
     uint32_t lease_s = 0;
     idx = dhcp_parse_option_bounded(p, payload_len, 51);
     if (idx != UINT16_MAX && p->options[idx+1] >= 4) {
-        uint32_t lease_net;
-        memcpy(&lease_net, &p->options[idx+2], 4);
-        lease_s = bswap32(lease_net);
+        lease_s = rd_be32(&p->options[idx+2]);
         rt_local.lease = lease_s;
     }
 
     uint32_t t1_s = 0;
     idx = dhcp_parse_option_bounded(p, payload_len, 58);
     if (idx != UINT16_MAX && p->options[idx+1] >= 4) {
-        uint32_t t1_net;
-        memcpy(&t1_net, &p->options[idx+2], 4);
-        t1_s = bswap32(t1_net);
+        t1_s = rd_be32(&p->options[idx+2]);
     } else {
         if (lease_s) t1_s = lease_s / 2;
     }
     uint32_t t2_s = 0;
     idx = dhcp_parse_option_bounded(p, payload_len, 59);
     if (idx != UINT16_MAX && p->options[idx+1] >= 4) {
-        uint32_t t2_net;
-        memcpy(&t2_net, &p->options[idx+2], 4);
-        t2_s = bswap32(t2_net);
+        t2_s = rd_be32(&p->options[idx+2]);
     } else {
         if (lease_s) t2_s = (lease_s / 8) * 7;
     }
@@ -435,7 +415,7 @@ static void dhcp_send_renew_for(dhcp_if_state_t* st, bool new_transaction) {
     uint32_t dip = st->server_ip_net ? bswap32(st->server_ip_net) : IPV4_LIMITED_BROADCAST;
     net_l4_endpoint dst;
     make_ep(&dip, 67, IP_VER4, &dst);
-    if (send_to_socket(st->sock, &dst, &pkt, pkt_len) >= 0) st->rx_fast_left_ms = 1000;
+    if (send_to_socket(st->sock, &dst, &pkt, pkt_len) == pkt_len) st->rx_fast_left_ms = 1000;
 }
 
 static void dhcp_send_rebind_for(dhcp_if_state_t* st, bool new_transaction) {
@@ -457,7 +437,7 @@ static void dhcp_send_rebind_for(dhcp_if_state_t* st, bool new_transaction) {
     uint32_t dip = IPV4_LIMITED_BROADCAST;
     net_l4_endpoint dst;
     make_ep(&dip, 67, IP_VER4, &dst);
-    if (send_to_socket(st->sock, &dst, &pkt, pkt_len) >= 0) st->rx_fast_left_ms = 1000;
+    if (send_to_socket(st->sock, &dst, &pkt, pkt_len) == pkt_len) st->rx_fast_left_ms = 1000;
 }
 
 static uint32_t dhcp_send_inform_for(dhcp_if_state_t* st) {
@@ -478,7 +458,7 @@ static uint32_t dhcp_send_inform_for(dhcp_if_state_t* st) {
     uint32_t dip = IPV4_LIMITED_BROADCAST;
     net_l4_endpoint dst;
     make_ep(&dip, 67, IP_VER4, &dst);
-    if (send_to_socket(st->sock, &dst, &pkt, pkt_len) < 0) return 0;
+    if (send_to_socket(st->sock, &dst, &pkt, pkt_len) != pkt_len) return 0;
     return xid;
 }
 
@@ -700,9 +680,7 @@ static void maybe_send_inform() {
                     rt.dns[0] = 0;
                     rt.dns[1] = 0;
                     for (int d = 0; d < 2 && d * 4 + 4 <= len; d++) {
-                        uint32_t dns_net;
-                        memcpy(&dns_net, &ack.options[idx + 2 + d*4], 4);
-                        rt.dns[d] = bswap32(dns_net);
+                        rt.dns[d] = rd_be32(&ack.options[idx + 2 + d*4]);
                     }
                 }
 
@@ -712,17 +690,13 @@ static void maybe_send_inform() {
                     rt.ntp[0] = 0;
                     rt.ntp[1] = 0;
                     for (int n = 0; n < 2 && n * 4 + 4 <= len; n++) {
-                        uint32_t ntp_net;
-                        memcpy(&ntp_net, &ack.options[idx + 2 + n*4], 4);
-                        rt.ntp[n] = bswap32(ntp_net);
+                        rt.ntp[n] = rd_be32(&ack.options[idx + 2 + n*4]);
                     }
                 }
 
                 idx = dhcp_parse_option_bounded(&ack, ack_len, 26);
                 if (idx != UINT16_MAX && ack.options[idx + 1] == 2) {
-                    uint16_t mtu_net;
-                    memcpy(&mtu_net, &ack.options[idx + 2], 2);
-                    uint16_t mtu = bswap16(mtu_net);
+                    uint16_t mtu = rd_be16(&ack.options[idx + 2]);
                     if (mtu >= 68) rt.mtu = mtu;
                 }
                 l3_ipv4_update(v4->l3_id, v4->ip, v4->mask, v4->gw, IPV4_CFG_STATIC, &rt);

@@ -1077,6 +1077,18 @@ uint16_t l3_ipv6_effective_mtu(const l3_ipv6_interface_t *l3) {
     return mtu;
 }
 
+uint32_t l3_epoch(l3_id_t l3_id) {
+    if (!l3_id) return 0;
+    if (l3_id <= MAX_IPV4_L3_INTERFACES) {
+        l3_ipv4_interface_t* v4 = l3_ipv4_find_by_id(l3_id);
+        if (v4) return v4->epoch;
+        return 0;
+    }
+    l3_ipv6_interface_t* v6 = l3_ipv6_find_by_id(l3_id);
+    if (v6) return v6->epoch;
+    return 0;
+}
+
 bool l2_ipv6_set_link_mtu(uint8_t ifindex, uint16_t mtu) {
     l2_interface_t* l2 = l2_interface_find_by_index(ifindex);
     if (!l2 || mtu < 1280) return false;

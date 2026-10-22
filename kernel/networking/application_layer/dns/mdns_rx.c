@@ -131,7 +131,7 @@ static bool mdns_has_conflict(const dns_record_t* records, uint32_t count, const
     return false;
 }
 
-static void mdns_rx_response(l2_interface_t* l2, dns_record_t* records, uint32_t count) {
+static void mdns_rx_response(l2_interface_t* l2, l3_id_t l3_id, dns_record_t* records, uint32_t count) {
     if (!l2->ifindex || l2->ifindex > MAX_L2_INTERFACES) return;
     uint32_t l2_slot = (uint32_t)l2->ifindex - 1;
 
@@ -142,8 +142,8 @@ static void mdns_rx_response(l2_interface_t* l2, dns_record_t* records, uint32_t
         if (dns_wire_name_equals(r->name, g_mdns_fqdn)) host_name = true;
         if (r->type == DNS_TYPE_A || r->type == DNS_TYPE_AAAA) {
             uint32_t ttl_ms = r->ttl_s > (UINT32_MAX-1) / 1000 ? UINT32_MAX - 1 : r->ttl_s * 1000;
-            if (!r->ttl_s) dns_cache_remove_ip(r->name, r->type);
-            else dns_cache_put_ip(r->name, r->type, r->addr, ttl_ms);
+            if (!r->ttl_s) dns_cache_remove_ip(l3_id, r->name, r->type);
+            else dns_cache_put_ip(l3_id, r->name, r->type, r->addr, ttl_ms);
         }
     }
 
@@ -249,7 +249,7 @@ void mdns_rx(socket_handle_t sock, l3_id_t l3_id, ip_version_t ver, const uint8_
 
     if (flags & DNS_FLAG_QR) {
         if (src->port != DNS_MDNS_PORT) return;
-        mdns_rx_response(l2, records, record_count);
+        mdns_rx_response(l2, l3_id, records, record_count);
         return;
     }
 
@@ -334,20 +334,17 @@ void mdns_rx(socket_handle_t sock, l3_id_t l3_id, ip_version_t ver, const uint8_
                 const char *p = norm;
                 for (int i = 3; i >= 0; i--) {
                     const char *label = p;
+                    while (*label && *label != '.') label++;
                     uint32_t v = 0;
-                    while (is_digit(*p) && (p - label) < 3) v = v * 10 + (*p++ - '0');//strtoul might be more readable TODO
-                    if (p == label || is_digit(*p) || v > 255) {
+                    if (*label != '.' || label - p > 3 || !parse_uint32_dec_len(p, label - p, &v) || v > 255) {
                         valid_reverse = false;
                         break;
                     }
-                    ip[i] = (uint8_t)v;
-                    if (i && *p++ != '.') {
-                        valid_reverse = false;
-                        break;
-                    }
+                    ip[i] = v;
+                    p = label + 1;
                 }
                 if (valid_reverse) {
-                    if (*p++ != '.' || strcmp(p, "in-addr.arpa") != 0) valid_reverse = false;
+                    if (strcmp(p, "in-addr.arpa") != 0) valid_reverse = false;
                     else ipq = rd_be32(ip);
                 }
             }

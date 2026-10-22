@@ -1,17 +1,17 @@
 #include "dns_wire.h"
-#include "std/std.h"
 #include "std/string.h"
+#include "std/memory.h"
 
 uint32_t dns_wire_put_u16(uint8_t *out, uint32_t cap, uint32_t off, uint16_t v) {
     if (!out) return 0;
-    if (off + 2 > cap) return 0;
+    if (off > cap || cap - off < 2) return 0;
     wr_be16(out + off, v);
     return off + 2;
 }
 
 uint32_t dns_wire_put_u32(uint8_t *out, uint32_t cap, uint32_t off, uint32_t v) {
     if (!out) return 0;
-    if (off + 4 > cap) return 0;
+    if (off > cap || cap - off < 4) return 0;
     wr_be32(out + off, v);
     return off + 4;
 }
@@ -47,11 +47,23 @@ bool dns_wire_name_normalize(const char *name, char *out, uint32_t out_cap) {
 }
 
 bool dns_wire_name_equals(const char *a, const char *b) {
-    char na[DNS_WIRE_MAX_NAME];
-    char nb[DNS_WIRE_MAX_NAME];
-    if (!dns_wire_name_normalize(a, na, sizeof(na))) return false;
-    if (!dns_wire_name_normalize(b, nb, sizeof(nb))) return false;
-    return strcmp(na, nb) == 0;
+    if (!a || !b) return false;
+    uint32_t alen = strlen(a);
+    uint32_t blen = strlen(b);
+    while (alen && a[alen - 1] == '.') alen--;
+    while (blen && b[blen - 1] == '.') blen--;
+    if (!alen || alen != blen || alen >= DNS_WIRE_MAX_NAME) return false;
+
+    uint32_t label_len = 0;
+    for (uint32_t i = 0; i < alen; i++) {
+        char c = tolower(a[i]);
+        if (c != tolower(b[i])) return false;
+        if (c == '.') {
+            if (!label_len) return false;
+            label_len = 0;
+        } else if (c <= 32 || ++label_len > 63) return false;
+    }
+    return label_len != 0;
 }
 
 bool dns_wire_is_local_name(const char *name) {
@@ -86,7 +98,7 @@ bool dns_wire_write_name(uint8_t *out, uint32_t cap, uint32_t *off, const char *
         if (!len || len > 63) return false;
         wire_len += 1 + len;
         if (wire_len > 255) return false;
-        if (idx + 1 + len > cap) return false;
+        if (idx > cap || cap - idx < 1 + len) return false;
 
         out[idx++] = len;
         memcpy(out + idx, name + start, len);
@@ -154,7 +166,7 @@ bool dns_wire_read_name(const uint8_t *msg, uint32_t msg_len, uint32_t off, char
 
         uint32_t label_len = c;
         if (label_len > 63) return false;
-        if (idx + label_len > msg_len) return false;
+        if (label_len > msg_len - idx) return false;
 
         if (!skip) {
             if (out_idx) {
@@ -174,7 +186,7 @@ bool dns_wire_read_rr(const uint8_t *msg, uint32_t msg_len, uint32_t off, dns_se
     if (!rr) return false;
     memset(rr, 0, sizeof(*rr));
     if (!dns_wire_read_name(msg, msg_len, off, rr->name, sizeof(rr->name), &off)) return false;
-    if (off + 10 > msg_len) return false;
+    if (off > msg_len || msg_len - off < 10) return false;
 
     rr->type = rd_be16(msg + off);
     rr->rrclass = rd_be16(msg + off + 2);
@@ -182,7 +194,7 @@ bool dns_wire_read_rr(const uint8_t *msg, uint32_t msg_len, uint32_t off, dns_se
     rr->rdlen = rd_be16(msg + off + 8);
     rr->rdata_off = off + 10;
     rr->section = section;
-    if (rr->rdata_off + rr->rdlen > msg_len) return false;
+    if (rr->rdlen > msg_len - rr->rdata_off) return false;
     if (out_next) *out_next = rr->rdata_off + rr->rdlen;
     return true;
 }
@@ -191,7 +203,7 @@ bool dns_wire_parse_rdata(const uint8_t *msg, uint32_t msg_len, const dns_rr_vie
     if (!msg) return false;
     if (!rr) return false;
     if (!out) return false;
-    if (rr->rdata_off + rr->rdlen > msg_len) return false;
+    if (rr->rdata_off > msg_len || rr->rdlen > msg_len - rr->rdata_off) return false;
 
     memset(out, 0, sizeof(*out));
     strncpy(out->name, rr->name, sizeof(out->name));
@@ -228,10 +240,7 @@ bool dns_wire_parse_rdata(const uint8_t *msg, uint32_t msg_len, const dns_rr_vie
             uint8_t len = rdata[idx++];
             if (idx + len > rr->rdlen) return false;
             if (len) {
-                if (out_idx) {
-                    if (out_idx+1 >= sizeof(out->txt)) return true;
-                    out->txt[out_idx++] = ';';
-                }
+                if (out_idx && out_idx + 1 < sizeof(out->txt)) out->txt[out_idx++] = ';';
                 uint32_t copy = len;
                 if (out_idx + copy >= sizeof(out->txt)) copy = sizeof(out->txt) - out_idx - 1;
                 memcpy(out->txt + out_idx, rdata + idx, copy);
@@ -304,10 +313,15 @@ uint32_t dns_wire_write_record_rdata(const dns_record_t *record, uint8_t *out, u
             while (*txt && *txt != ';' && *txt != '\n' && *txt != '\r') txt++;
             uint32_t len = (uint32_t)(txt - start);
             if (len > 255) len = 255;
-            if (off + 1 + len > cap) return 0;
+            if (off > cap || cap - off < 1 + len) return 0;
             out[off++] = (uint8_t)len;
             memcpy(out + off, start, len);
             off += len;
+        }
+        if (!off) {
+            if (!cap) return 0;
+            out[0] = 0;
+            return 1;
         }
         return off;
     }
@@ -344,6 +358,14 @@ int dns_wire_record_cmp(const dns_record_t *a, const dns_record_t *b) {
     if (ac != bc) return ac > bc ? 1 : -1;
     if (a->type != b->type) return a->type > b->type ? 1 : -1;
 
+    if (a->type == DNS_TYPE_A || a->type == DNS_TYPE_AAAA) {
+        uint32_t n = a->type == DNS_TYPE_A ? 4 : 16;
+        int32_t cmp = memcmp(a->addr, b->addr, n);
+        if (cmp > 0) return 1;
+        if (cmp < 0) return -1;
+        return 0;
+    }
+
     uint8_t ar[DNS_WIRE_MAX_NAME + 8];
     uint8_t br[DNS_WIRE_MAX_NAME + 8];
     uint32_t alen = dns_wire_write_record_rdata(a, ar, sizeof(ar));
@@ -371,21 +393,15 @@ bool dns_wire_parse_records(const uint8_t *msg, uint32_t msg_len, bool check_id,
     uint32_t off = 12;
     for (uint16_t i = 0; i < qd; i++) {
         if (!dns_wire_read_name(msg, msg_len, off, NULL, 0, &off)) return false;
-        if (off + 4 > msg_len) return false;
+        if (off > msg_len || msg_len - off < 4) return false;
         off += 4;
     }
 
     uint32_t count = 0;
-    uint32_t section_count[3];
-    dns_section_t section[3];
-    section_count[0] = an;
-    section_count[1] = ns;
-    section_count[2] = ar;
-    section[0] = DNS_SECTION_ANSWER;
-    section[1] = DNS_SECTION_AUTHORITY;
-    section[2] = DNS_SECTION_ADDITIONAL;
+    const uint32_t section_count[] = {an, ns, ar};
+    const dns_section_t section[] = {DNS_SECTION_ANSWER, DNS_SECTION_AUTHORITY, DNS_SECTION_ADDITIONAL};
 
-    for (uint32_t s = 0; s < 3; s++) {
+    for (uint32_t s = 0; s < N_ARR(section_count); s++) {
         for (uint32_t i = 0; i < section_count[s]; i++) {
             dns_rr_view_t rr;
             if (!dns_wire_read_rr(msg, msg_len, off, section[s], &rr, &off)) return false;
@@ -401,14 +417,14 @@ uint32_t dns_wire_build_query(uint8_t *out, uint32_t cap, uint16_t message_id, c
     if (!out) return 0;
     if (cap < 12) return 0;
 
-    memset(out, 0, cap);
+    memset(out, 0, 12);
     wr_be16(out, message_id);
     wr_be16(out + 2, message_id ? DNS_FLAG_RD : 0);
     wr_be16(out + 4,1);
 
     uint32_t off = 12;
     if (!dns_wire_write_name(out, cap, &off, name)) return 0;
-    if (off + 4 > cap) return 0;
+    if (off > cap || cap - off < 4) return 0;
     wr_be16(out + off, qtype);
     wr_be16(out + off + 2, mdns_qu?  DNS_CLASS_UNICAST_RESPONSE | DNS_CLASS_IN : DNS_CLASS_IN);
     return off + 4;
